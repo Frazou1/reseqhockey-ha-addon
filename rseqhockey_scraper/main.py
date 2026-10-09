@@ -215,7 +215,7 @@ _BLACKLIST_EQUIPES = {
 
 def parse_schedule_structured(html: str):
     try:
-        with open("/data/schedule_debug.html", "w", encoding="utf-8") as f:
+        with open("/share/schedule_debug.html", "w", encoding="utf-8") as f:
             f.write(html)
     except Exception:
         pass
