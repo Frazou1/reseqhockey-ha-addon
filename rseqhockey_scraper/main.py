@@ -77,7 +77,6 @@ def parse_roster_structured(html: str):
     joueurs = []
     personnel = []
 
-    # 1. Parsing par balises <table> HTML
     tables = soup.find_all("table")
     for t_idx, table in enumerate(tables):
         rows = table.select("tbody tr")
@@ -98,7 +97,6 @@ def parse_roster_structured(html: str):
                     if not any(j["nom"] == clean_n for j in joueurs):
                         joueurs.append(item)
 
-    # 2. Parsing de secours par Regex
     if not joueurs and not gardiens:
         staff_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(Entraîneur-Adjoint|Entraîneur-Chef|Entraîneur|Gérant|Préposé)', text)
         for raw_name, role in staff_matches:
@@ -165,25 +163,35 @@ def parse_standings(html: str):
                 all_rows.append(row)
     return all_rows
 
-async def wait_for_cloudflare(page, timeout_sec=20):
+async def wait_for_cloudflare(page, timeout_sec=25):
+    """Détecte dynamiquement la fin de la vérification Cloudflare (FR & EN)."""
     for i in range(timeout_sec):
-        title = await page.title()
-        content = await page.content()
-        if "Just a moment" not in title and "security verification" not in content.lower():
-            print(f"[CLOUDFLARE BYPASS] Franchi après {i+1}s (Titre: '{title}')")
+        title = (await page.title()).lower()
+        content = (await page.content()).lower()
+        
+        # Mots-clés indiquant que Cloudflare est TOUJOURS en train de vérifier
+        is_cf_active = any(term in title for term in ["just a moment", "un instant"]) or \
+                        any(term in content for term in ["vérification de sécurité", "verification de securite", "security verification", "cf-mitigated", "turnstile"])
+        
+        if not is_cf_active:
+            real_title = await page.title()
+            print(f"[CLOUDFLARE BYPASS] Validé après {i+1}s ! (Titre final: '{real_title}')")
             return True
+            
+        if (i + 1) % 3 == 0:
+            print(f"[CLOUDFLARE] Vérification de sécurité en cours ({i+1}s)...")
         await page.wait_for_timeout(1000)
-    print("[CLOUDFLARE WARN] Défi non franchi avant timeout.")
+        
+    print("[CLOUDFLARE WARN] Défi non franchi dans le délai imparti.")
     return False
 
 async def load_page_with_debug(page, url, key_name):
     print(f"\n[SCRAPE] Navigation vers '{key_name}': {url}")
-    await page.goto(url, wait_until="domcontentloaded", timeout=35000)
+    await page.goto(url, wait_until="domcontentloaded", timeout=40000)
     
-    # Attente active de la résolution du challenge Cloudflare
+    # Attente active que Cloudflare disparaisse
     await wait_for_cloudflare(page)
     
-    # Attente complémentaire pour l'hydratation React
     try:
         await page.wait_for_selector("table, div.spordle-container, div.team-roster, div.schedule-container", timeout=8000)
         print(f"[SCRAPE DEBUG '{key_name}'] Composant DOM détecté !")
@@ -202,7 +210,7 @@ async def load_page_with_debug(page, url, key_name):
 
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v1.6.4 (Équipe: {MY_TEAM_NAME})")
+    print(f"[START] Scraping RseqHockey v1.6.5 (Équipe: {MY_TEAM_NAME})")
     print(f"==================================================")
     
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -226,7 +234,6 @@ async def scrape_and_publish():
             locale="fr-CA"
         )
         
-        # Masquage de l'empreinte d'automatisation
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
@@ -237,7 +244,7 @@ async def scrape_and_publish():
 
         print("[SESSION] Connexion initiale à la plateforme RSEQ...")
         try:
-            await page.goto("https://scolaire.rseqhockey.com/fr", wait_until="domcontentloaded", timeout=30000)
+            await page.goto("https://scolaire.rseqhockey.com/fr", wait_until="domcontentloaded", timeout=35000)
             await wait_for_cloudflare(page)
             cookie_btn = page.locator("button:has-text('Accepter')").or_(page.locator("button:has-text('Accept')"))
             if await cookie_btn.count() > 0:
@@ -291,7 +298,7 @@ async def scrape_and_publish():
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", schedule_data)
 
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config", 
-        build_config(f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}", f"rseqhockey_{TEAM_ID}_standings", f"rseqhockey/{TEAM_ID}_standings/state", f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy"))
+        build_config(f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}", f"rseqhockey_{TEAM_ID}_standings", f"rseqhockey/{TEAM_ID}/standings/state", f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state", f"{my_team_info.get('#', 'N/A')}e rang" if my_team_info else "Saison en cours")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes", {"mon_equipe": my_team_info, "classement_complet": standings_list})
 
