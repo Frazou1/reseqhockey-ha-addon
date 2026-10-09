@@ -65,20 +65,13 @@ def clean_player_name(name: str) -> str:
 
 def parse_roster_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ")
-    
-    print(f"[DEBUG ROSTER] Longueur HTML: {len(html)} chars | Tables trouvées: {len(soup.find_all('table'))}")
-    print(f"[DEBUG ROSTER EXTRAIT]: {text[:250]}...")
-
     gardiens = []
     joueurs = []
     personnel = []
 
-    # 1. Extraction par tableaux HTML
     tables = soup.find_all("table")
-    for t_idx, table in enumerate(tables):
+    for table in tables:
         rows = table.select("tbody tr")
-        print(f"[DEBUG ROSTER TABLE #{t_idx}] {len(rows)} ligne(s) détectée(s)")
         for tr in rows:
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= 3:
@@ -95,8 +88,8 @@ def parse_roster_structured(html: str):
                     if not any(j["nom"] == clean_n for j in joueurs):
                         joueurs.append(item)
 
-    # 2. Méthode Regex de secours
     if not joueurs and not gardiens:
+        text = soup.get_text(" ")
         staff_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(Entraîneur-Adjoint|Entraîneur-Chef|Entraîneur|Gérant|Préposé)', text)
         for raw_name, role in staff_matches:
             clean_n = clean_player_name(raw_name)
@@ -124,9 +117,6 @@ def parse_schedule_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ")
     
-    print(f"[DEBUG SCHEDULE] Longueur HTML: {len(html)} chars")
-    print(f"[DEBUG SCHEDULE EXTRAIT]: {text[:250]}...")
-
     dates = re.findall(r'((?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)?\s*\d{1,2}\s+(?:janv\.|févr\.|mars|avr\.|mai|juin|juill\.|août|sept\.|oct\.|nov\.|déc\.|janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s+\d{4})', text, re.I)
     unique_dates = list(dict.fromkeys([d.strip() for d in dates if len(d.strip()) > 5]))
     
@@ -165,60 +155,88 @@ def parse_standings(html: str):
                 all_rows.append(row)
     return all_rows
 
+async def bypass_cloudflare_and_load(page, url):
+    print(f"[SCRAPE] Chargement de {url}...")
+    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    
+    # Attente active du franchissement du challenge Cloudflare
+    for attempt in range(10):
+        content = await page.content()
+        if "Just a moment" not in content and "security verification" not in content:
+            print(f"[CLOUDFLARE BYPASS] Validation réussie après {attempt*2}s !")
+            break
+        print("[CLOUDFLARE] Attente de la vérification de sécurité...")
+        await page.wait_for_timeout(2000)
+
+    await page.wait_for_timeout(3000)
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+    await page.wait_for_timeout(1000)
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(1500)
+    return await page.content()
+
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v1.6.0 (Équipe: {MY_TEAM_NAME})")
+    print(f"[START] Scraping RseqHockey v1.6.1 (Équipe: {MY_TEAM_NAME})")
     print(f"==================================================")
     
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
-    
-    urls_to_scrape = {
-        "roster": f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}?tab=roster",
-        "schedule": f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}?tab=schedule",
-        "standings": f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}?tab=standings",
-        "stats_saison_reguliere": f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats"
-    }
+    team_base_url = f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}"
 
     scraped_html = {}
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--disable-web-security"
+            ]
+        )
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
+            viewport={"width": 1366, "height": 768},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            locale="fr-CA"
         )
         page = await context.new_page()
 
+        # Étape 1 : Passer Cloudflare sur la page principale de l'équipe
+        await bypass_cloudflare_and_load(page, team_base_url)
+        scraped_html["roster"] = await page.content()
+
+        # Étape 2 : Cliquer sur l'onglet Schedule s'il existe, sinon recharger l'URL direct
         try:
-            print("[SESSION] Initialisation de la session RseqHockey...")
-            await page.goto("https://scolaire.rseqhockey.com/fr", wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(2000)
-            cookie_btn = page.locator("button:has-text('Accepter')").or_(page.locator("button:has-text('Accept')"))
-            if await cookie_btn.count() > 0:
-                await cookie_btn.first.click()
-                print("[SESSION] Cookies acceptés.")
-                await page.wait_for_timeout(1000)
+            schedule_tab = page.locator("text=Horaire").or_(page.locator("text=Schedule")).or_(page.locator("a[href*='tab=schedule']"))
+            if await schedule_tab.count() > 0:
+                print("[NAVIGATION] Clic sur l'onglet Horaire...")
+                await schedule_tab.first.click()
+                await page.wait_for_timeout(3000)
+                scraped_html["schedule"] = await page.content()
+            else:
+                scraped_html["schedule"] = await bypass_cloudflare_and_load(page, f"{team_base_url}?tab=schedule")
         except Exception as e:
-            print(f"[SESSION NOTE] {e}")
+            print(f"[SCHEDULE NAV NOTE] {e}")
+            scraped_html["schedule"] = await bypass_cloudflare_and_load(page, f"{team_base_url}?tab=schedule")
 
-        for key, url in urls_to_scrape.items():
-            try:
-                print(f"[SCRAPE] Chargement de '{key}' ({url})...")
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(4000)
+        # Étape 3 : Standings
+        try:
+            standings_tab = page.locator("text=Classement").or_(page.locator("text=Standings")).or_(page.locator("a[href*='tab=standings']"))
+            if await standings_tab.count() > 0:
+                print("[NAVIGATION] Clic sur l'onglet Classement...")
+                await standings_tab.first.click()
+                await page.wait_for_timeout(3000)
+                scraped_html["standings"] = await page.content()
+            else:
+                scraped_html["standings"] = await bypass_cloudflare_and_load(page, f"{team_base_url}?tab=standings")
+        except Exception as e:
+            print(f"[STANDINGS NAV NOTE] {e}")
+            scraped_html["standings"] = await bypass_cloudflare_and_load(page, f"{team_base_url}?tab=standings")
 
-                # Scroll progressif
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                await page.wait_for_timeout(1000)
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2000)
-
-                html_content = await page.content()
-                scraped_html[key] = html_content
-                print(f"[SCRAPE OK] '{key}' chargé ({len(html_content)} octets)")
-            except Exception as e:
-                print(f"[SCRAPE ERROR] Échec sur {key}: {e}")
-                scraped_html[key] = ""
+        # Étape 4 : Stats Saison Régulière
+        stats_url = f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats"
+        scraped_html["stats_saison_reguliere"] = await bypass_cloudflare_and_load(page, stats_url)
 
         await browser.close()
 
@@ -233,7 +251,6 @@ async def scrape_and_publish():
 
     print("\n[MQTT] Début de la publication sur le broker...")
 
-    # Configuration MQTT Discovery robuste
     def build_config(name, object_id, state_topic, attr_topic, icon):
         return {
             "name": name,
