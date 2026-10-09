@@ -2,11 +2,10 @@ import json
 import time
 import re
 import os
-import urllib.request
 import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
 import paho.mqtt.client as mqtt
-from playwright.async_api import async_playwright
 
 with open("/data/options.json", "r") as f:
     config = json.load(f)
@@ -19,7 +18,11 @@ MQTT_HOST = config.get("mqtt_host", "core-mosquitto")
 MQTT_PORT = config.get("mqtt_port", 1883)
 MQTT_USER = config.get("mqtt_user", "")
 MQTT_PASS = config.get("mqtt_password", "")
-INTERVAL = config.get("update_interval_hours", 1) * 3600  # défaut 1h pour garder le cookie frais
+INTERVAL = config.get("update_interval_hours", 6) * 3600
+
+# --- FlareSolverr ---
+FLARESOLVERR_URL = config.get("flaresolverr_url", "http://192.168.2.65:8191/v1")
+FLARESOLVERR_TIMEOUT = config.get("flaresolverr_timeout", 90)  # en secondes
 
 LEAGUE_UUID = "ae5bed83-a302-4ac5-927b-639d2c20a3c9"
 SCHEDULE_SAISON_REGULIERE = "198862"
@@ -27,10 +30,6 @@ SCHEDULE_SAISON_REGULIERE = "198862"
 LOGOS_DIR = "/share/rseqhockey_logos"
 WWW_LOGOS_DIR = "/config/www/rseqhockey_logos"
 os.makedirs(LOGOS_DIR, exist_ok=True)
-
-# Profil persistant Playwright (garde les cookies Cloudflare entre les runs)
-USER_DATA_DIR = "/data/playwright_profile"
-os.makedirs(USER_DATA_DIR, exist_ok=True)
 
 if os.path.exists("/config/www") and not os.path.exists(WWW_LOGOS_DIR):
     try:
@@ -44,6 +43,46 @@ DEVICE_INFO = {
     "model": "RSEQ Scraper",
     "manufacturer": "Spordle / RSEQ"
 }
+
+# ---------- FLARESOLVERR ----------
+
+async def fetch_with_flaresolverr(session, url, key_name):
+    """Récupère le HTML d'une URL via FlareSolverr (bypass Cloudflare)."""
+    print(f"\n[FLARESOLVERR] Requête '{key_name}': {url}")
+    payload = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": FLARESOLVERR_TIMEOUT * 1000
+    }
+    try:
+        async with session.post(FLARESOLVERR_URL, json=payload) as resp:
+            data = await resp.json()
+    except Exception as e:
+        print(f"[FLARESOLVERR ERROR '{key_name}'] Requête HTTP échouée: {e}")
+        return None
+
+    status = data.get("status")
+    if status != "ok":
+        print(f"[FLARESOLVERR ERROR '{key_name}'] Status: {status} | Message: {data.get('message')}")
+        return None
+
+    solution = data.get("solution", {})
+    html = solution.get("response", "")
+    if not html:
+        print(f"[FLARESOLVERR ERROR '{key_name}'] Réponse vide.")
+        return None
+
+    # Vérification défensive : est-ce que Cloudflare est encore dans la page ?
+    lower = html.lower()
+    if "vérification de sécurité en cours" in lower or "just a moment" in lower:
+        print(f"[FLARESOLVERR WARN '{key_name}'] Page challenge détectée malgré status ok.")
+        return None
+
+    print(f"[FLARESOLVERR OK '{key_name}'] {len(html)} octets reçus.")
+    return html
+
+
+# ---------- MQTT ----------
 
 def publish_to_mqtt(topic, payload):
     try:
@@ -61,11 +100,15 @@ def publish_to_mqtt(topic, payload):
     except Exception as e:
         print(f"[MQTT ERROR] Échec sur {topic}: {e}")
 
+
+# ---------- PARSING ----------
+
 def clean_player_name(name: str) -> str:
     name = name.strip()
     if len(name) > 1 and name[0] == name[1] and name[0].isupper():
         name = name[1:]
     return name
+
 
 def parse_roster_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
@@ -125,6 +168,7 @@ def parse_roster_structured(html: str):
     print(f"[PARSING ROSTER] {len(gardiens)} gardien(s), {len(joueurs)} joueur(s), {len(personnel)} membre(s) du personnel trouvés.")
     return {"gardiens": gardiens, "joueurs": joueurs, "personnel": personnel}
 
+
 def parse_schedule_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
@@ -141,6 +185,7 @@ def parse_schedule_structured(html: str):
     print(f"[PARSING SCHEDULE] {len(unique_dates)} date(s) de match trouvée(s).")
     return {"dates_trouvees": unique_dates, "prochains_matchs": events}
 
+
 def parse_table_generic(html: str):
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
@@ -153,6 +198,7 @@ def parse_table_generic(html: str):
         if len(tds) >= len(headers):
             rows.append(dict(zip(headers, tds)))
     return rows
+
 
 def parse_standings(html: str):
     soup = BeautifulSoup(html, "html.parser")
@@ -167,159 +213,41 @@ def parse_standings(html: str):
                 all_rows.append(row)
     return all_rows
 
-async def wait_for_cloudflare(page, timeout_sec=40):
-    """Détecte la fin du challenge Cloudflare en vérifiant le VRAI contenu (tables)."""
-    for i in range(timeout_sec):
-        try:
-            title = (await page.title()).lower()
-            content = (await page.content()).lower()
-        except Exception:
-            await page.wait_for_timeout(1000)
-            continue
 
-        # Indices que Cloudflare est ENCORE actif
-        is_cf_active = (
-            any(term in title for term in ["just a moment", "un instant"]) or
-            "vérification de sécurité en cours" in content or
-            "verification de securite en cours" in content or
-            "cf-mitigated" in content or
-            "challenge-platform" in content
-        )
-
-        # Indice qu'on a le VRAI contenu
-        try:
-            has_real_content = (await page.locator("table, .spordle-container, div.team-roster, div.schedule-container").count()) > 0
-        except Exception:
-            has_real_content = False
-
-        if not is_cf_active and has_real_content:
-            real_title = await page.title()
-            print(f"[CLOUDFLARE BYPASS] Validé après {i+1}s (Titre: '{real_title}')")
-            return True
-
-        # Si après 10s Cloudflare semble inactif mais aucun contenu réel => blocage silencieux
-        if not is_cf_active and not has_real_content and i >= 10:
-            print(f"[CLOUDFLARE FAIL] Challenge 'passé' mais contenu réel absent après {i+1}s.")
-            return False
-
-        if (i + 1) % 5 == 0:
-            print(f"[CLOUDFLARE] Vérification en cours ({i+1}s)...")
-        await page.wait_for_timeout(1000)
-
-    print("[CLOUDFLARE WARN] Défi non franchi dans le délai imparti.")
-    return False
-
-async def load_page_with_debug(page, url, key_name):
-    print(f"\n[SCRAPE] Navigation vers '{key_name}': {url}")
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    except Exception as e:
-        print(f"[SCRAPE ERROR '{key_name}'] Navigation échouée: {e}")
-        return None
-
-    if not await wait_for_cloudflare(page):
-        return None
-
-    try:
-        await page.wait_for_selector("table, div.spordle-container, div.team-roster, div.schedule-container", timeout=10000)
-        print(f"[SCRAPE DEBUG '{key_name}'] Composant DOM détecté !")
-    except Exception:
-        print(f"[SCRAPE DEBUG '{key_name}'] Aucun sélecteur spécifique, poursuite...")
-
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-    await page.wait_for_timeout(1000)
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await page.wait_for_timeout(2000)
-
-    content = await page.content()
-    title = await page.title()
-    print(f"[SCRAPE OK '{key_name}'] Titre: '{title}' | Taille HTML: {len(content)} octets")
-    return content
+# ---------- SCRAPING PRINCIPAL ----------
 
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v1.7.0 (Équipe: {MY_TEAM_NAME})")
+    print(f"[START] Scraping RseqHockey v2.0.0 (FlareSolverr) - Équipe: {MY_TEAM_NAME}")
     print(f"==================================================")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
     team_url = f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}"
 
+    urls = {
+        "roster": f"{team_url}?tab=roster",
+        "schedule": f"{team_url}?tab=schedule",
+        "standings": f"{team_url}?tab=standings",
+        "stats_saison_reguliere": f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats",
+    }
+
     scraped_html = {}
-    context = None
 
-    try:
-        async with async_playwright() as p:
-            # --- PROFIL PERSISTANT : garde les cookies Cloudflare entre les runs ---
-            print(f"[SESSION] Utilisation du profil persistant: {USER_DATA_DIR}")
-            context = await p.chromium.launch_persistent_context(
-                USER_DATA_DIR,
-                headless=True,
-                viewport={"width": 1280, "height": 900},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                locale="fr-CA",
-                timezone_id="America/Toronto",
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-infobars",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                    "--window-size=1280,900",
-                ],
-            )
-
-            await context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['fr-CA', 'fr', 'en-US', 'en']});
-                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
-                window.chrome = { runtime: {} };
-            """)
-
-            page = context.pages[0] if context.pages else await context.new_page()
-
-            print("[SESSION] Connexion initiale à la plateforme RSEQ...")
-            try:
-                await page.goto("https://scolaire.rseqhockey.com/fr", wait_until="domcontentloaded", timeout=45000)
-                await wait_for_cloudflare(page)
-
-                # Accepter les cookies si la bannière apparaît
-                cookie_btn = page.locator("button:has-text('Accepter')").or_(page.locator("button:has-text('Accept')"))
-                if await cookie_btn.count() > 0:
-                    await cookie_btn.first.click()
-                    print("[SESSION] Cookies acceptés.")
-                    await page.wait_for_timeout(1500)
-            except Exception as e:
-                print(f"[SESSION NOTE] {e}")
-
-            scraped_html["roster"] = await load_page_with_debug(page, f"{team_url}?tab=roster", "roster")
-            scraped_html["schedule"] = await load_page_with_debug(page, f"{team_url}?tab=schedule", "schedule")
-            scraped_html["standings"] = await load_page_with_debug(page, f"{team_url}?tab=standings", "standings")
-
-            stats_url = f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats"
-            scraped_html["stats_saison_reguliere"] = await load_page_with_debug(page, stats_url, "stats_saison_reguliere")
-
-    except Exception as e:
-        print(f"[FATAL] Erreur pendant le scraping: {e}")
-    finally:
-        if context is not None:
-            try:
-                await context.close()
-            except Exception:
-                pass
-
-    # --- Vérification : si une page est None, Cloudflare a bloqué ---
-    failed = [k for k, v in scraped_html.items() if not v]
-    if failed:
-        print(f"\n[ABORT] Cloudflare a bloqué les pages suivantes: {failed}")
-        print("[ABORT] Aucune publication MQTT (pour éviter d'écraser les données valides).")
-        return
+    # Timeout global côté client aiohttp (le vrai timeout est géré par FlareSolverr)
+    timeout = aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT + 30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for key, url in urls.items():
+            html = await fetch_with_flaresolverr(session, url, key)
+            scraped_html[key] = html
+            if html is None:
+                print(f"[ABORT] Impossible de récupérer '{key}', arrêt du cycle pour ne pas publier de données incomplètes.")
+                return
 
     print("\n[PARSING] Traitement des données extraites...")
-    roster_data = parse_roster_structured(scraped_html.get("roster", ""))
-    schedule_data = parse_schedule_structured(scraped_html.get("schedule", ""))
-    player_stats_sr = parse_table_generic(scraped_html.get("stats_saison_reguliere", ""))
-    standings_list = parse_standings(scraped_html.get("standings", ""))
+    roster_data = parse_roster_structured(scraped_html["roster"])
+    schedule_data = parse_schedule_structured(scraped_html["schedule"])
+    player_stats_sr = parse_table_generic(scraped_html["stats_saison_reguliere"])
+    standings_list = parse_standings(scraped_html["standings"])
 
     my_team_info = next((t for t in standings_list if MY_TEAM_NAME in t.get("Équipe", "").upper()), None)
     player_info_sr = next((p for p in player_stats_sr if TRACKED_PLAYER in p.get("Nom", "").lower()), None) if TRACKED_PLAYER else None
@@ -368,6 +296,7 @@ async def scrape_and_publish():
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", {"joueurs": player_stats_sr})
 
     print("\n[FIN] Cycle terminé avec succès.")
+
 
 if __name__ == "__main__":
     while True:
