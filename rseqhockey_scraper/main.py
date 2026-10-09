@@ -43,36 +43,31 @@ DEVICE_INFO = {
     "manufacturer": "Spordle / RSEQ"
 }
 
+
 # ---------- FLARESOLVERR ----------
 
 async def fetch_with_flaresolverr(session, url, key_name):
     print(f"\n[FLARESOLVERR] Requête '{key_name}': {url}")
-    payload = {
-        "cmd": "request.get",
-        "url": url,
-        "maxTimeout": FLARESOLVERR_TIMEOUT * 1000
-    }
+    payload = {"cmd": "request.get", "url": url, "maxTimeout": FLARESOLVERR_TIMEOUT * 1000}
     try:
         async with session.post(FLARESOLVERR_URL, json=payload) as resp:
             data = await resp.json()
     except Exception as e:
-        print(f"[FLARESOLVERR ERROR '{key_name}'] Requête HTTP échouée: {e}")
+        print(f"[FLARESOLVERR ERROR '{key_name}'] {e}")
         return None
 
-    status = data.get("status")
-    if status != "ok":
-        print(f"[FLARESOLVERR ERROR '{key_name}'] Status: {status} | Message: {data.get('message')}")
+    if data.get("status") != "ok":
+        print(f"[FLARESOLVERR ERROR '{key_name}'] Status: {data.get('status')} | {data.get('message')}")
         return None
 
-    solution = data.get("solution", {})
-    html = solution.get("response", "")
+    html = data.get("solution", {}).get("response", "")
     if not html:
         print(f"[FLARESOLVERR ERROR '{key_name}'] Réponse vide.")
         return None
 
     lower = html.lower()
     if "vérification de sécurité en cours" in lower or "just a moment" in lower:
-        print(f"[FLARESOLVERR WARN '{key_name}'] Page challenge détectée malgré status ok.")
+        print(f"[FLARESOLVERR WARN '{key_name}'] Challenge encore présent.")
         return None
 
     print(f"[FLARESOLVERR OK '{key_name}'] {len(html)} octets reçus.")
@@ -92,7 +87,6 @@ def publish_to_mqtt(topic, payload):
     try:
         client.connect(MQTT_HOST, int(MQTT_PORT), keepalive=10)
         result = client.publish(topic, json.dumps(payload, ensure_ascii=False), retain=True)
-        # Debug : vérifier que la publication s'est bien passée
         result.wait_for_publish(timeout=5)
         if result.rc != 0:
             print(f"[MQTT WARN] rc={result.rc} sur {topic}")
@@ -102,168 +96,236 @@ def publish_to_mqtt(topic, payload):
         print(f"[MQTT ERROR] Échec sur {topic}: {e}")
 
 
-# ---------- PARSING ----------
+# ---------- HELPERS ----------
 
-def clean_player_name(name: str) -> str:
-    name = name.strip()
-    if len(name) > 1 and name[0] == name[1] and name[0].isupper():
-        name = name[1:]
-    return name
+def split_name_and_number(raw: str) -> tuple:
+    """
+    Découpe une chaîne du type 'AAANNABELLEMICHAUD35' en ('ANNABELLE MICHAUD', '35').
+    Le HTML de Spordle concatène prénom + nom + numéro sans séparateur,
+    avec parfois des lettres dupliquées parasites au début (ex: 'AAA', 'EEE').
+    """
+    raw = raw.strip()
+    if not raw:
+        return "", ""
 
+    # 1. Extraire le numéro à la fin
+    num_match = re.search(r'(\d+)$', raw)
+    numero = num_match.group(1) if num_match else ""
+    name_part = raw[:num_match.start()] if num_match else raw
+
+    # 2. Nettoyer les lettres dupliquées parasites au début (AAA, EEE, etc.)
+    #    Ex: 'AAANNABELLE' -> 'ANNABELLE', 'EEELLIOT' -> 'ELLIOT'
+    name_part = re.sub(r'^(.)\1+', r'\1', name_part, count=1)
+
+    # 3. Séparer prénom/nom : on cherche une majuscule après au moins 2 minuscules
+    #    Ex: 'ANNABELLEMICHAUD' -> 'ANNABELLE MICHAUD'
+    #    Astuce : on insère un espace avant toute majuscule qui suit une minuscule
+    #    ou avant une séquence majuscule qui termine un prénom
+    parts = re.split(r'(?<=[a-zéèêëàâäîïôöùûüç])(?=[A-ZÉÈÊËÀÂÄÎÏÔÖÙÛÜÇ])', name_part)
+    if len(parts) >= 2:
+        # Regrouper : tout sauf le dernier = prénom, dernier = nom
+        prenom = parts[0]
+        nom = " ".join(parts[1:])
+        full_name = f"{prenom} {nom}"
+    else:
+        # Fallback : tout en majuscules sans séparation détectable, on garde tel quel
+        full_name = name_part
+
+    # 4. Normaliser les espaces
+    full_name = re.sub(r'\s+', ' ', full_name).strip()
+    return full_name, numero
+
+
+def clean_role(role: str) -> str:
+    return role.strip()
+
+
+# ---------- PARSING ROSTER ----------
 
 def parse_roster_structured(html: str):
-    # --- DEBUG : sauvegarde du HTML brut ---
     try:
         with open("/data/roster_debug.html", "w", encoding="utf-8") as f:
             f.write(html)
-        print("[DEBUG FILE] /data/roster_debug.html écrit.")
-    except Exception as e:
-        print(f"[DEBUG FILE ERROR] {e}")
+    except Exception:
+        pass
 
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
-
-    print(f"\n--- [DEBUG ROSTER] ---")
-    print(f"Longueur HTML: {len(html)} octets")
-    print(f"Nombre de balises <table>: {len(soup.find_all('table'))}")
-    print(f"Extrait du texte capturé (300 chars):\n{text[:300]}")
-    print(f"----------------------\n")
-
     gardiens = []
     joueurs = []
     personnel = []
 
-    tables = soup.find_all("table")
-    for t_idx, table in enumerate(tables):
-        rows = table.select("tbody tr")
-        print(f"[DEBUG ROSTER TABLE #{t_idx}] {len(rows)} ligne(s) dans le tableau")
-
-        # --- DEBUG : afficher les en-têtes et les 3 premières lignes ---
+    for t_idx, table in enumerate(soup.find_all("table")):
         headers = [th.get_text(strip=True) for th in table.select("thead th")]
-        if headers:
-            print(f"   EN-TÊTES: {headers}")
-        for tr_dbg in rows[:3]:
-            tds_dbg = [td.get_text(strip=True) for td in tr_dbg.find_all("td")]
-            print(f"   Ligne brute: {tds_dbg}")
+        if not headers:
+            continue
 
-        for tr in rows:
-            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(tds) >= 2:
+        header_set = set(h.lower() for h in headers)
+
+        # --- Table des GARDIENS ---
+        if "gardiens" in header_set:
+            print(f"[ROSTER] Table #{t_idx} = GARDIENS")
+            for tr in table.select("tbody tr"):
+                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if len(tds) < 2:
+                    continue
+                full_name, numero = split_name_and_number(tds[0])
+                if not full_name:
+                    continue
+                stats = dict(zip(headers, tds))
+                gardiens.append({
+                    "nom": full_name,
+                    "numero": numero,
+                    "stats": stats
+                })
+
+        # --- Table des JOUEURS ---
+        elif "joueurs" in header_set:
+            print(f"[ROSTER] Table #{t_idx} = JOUEURS")
+            for tr in table.select("tbody tr"):
+                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if len(tds) < 2:
+                    continue
+                full_name, numero = split_name_and_number(tds[0])
+                if not full_name:
+                    continue
+                stats = dict(zip(headers, tds))
+                joueurs.append({
+                    "nom": full_name,
+                    "numero": numero,
+                    "stats": stats
+                })
+
+        # --- Table du PERSONNEL ---
+        elif any("personnel" in h.lower() for h in headers):
+            print(f"[ROSTER] Table #{t_idx} = PERSONNEL")
+            for tr in table.select("tbody tr"):
+                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+                if len(tds) < 2:
+                    continue
                 raw_name = tds[0]
-                num = tds[1] if tds[1].isdigit() else (tds[2] if len(tds) > 2 and tds[2].isdigit() else "")
-                pos = tds[-1].upper() if len(tds) >= 3 else "F"
-                clean_n = clean_player_name(raw_name)
-                item = {"nom": clean_n, "numero": num, "position": pos}
+                role = tds[1]
+                # Même format collé : 'AALEXIS HOULE' -> 'ALEXIS HOULE'
+                name_clean = re.sub(r'^(.)\1+', r'\1', raw_name.strip(), count=1)
+                name_clean = re.sub(r'\s+', ' ', name_clean).strip()
+                if name_clean:
+                    personnel.append({"nom": name_clean, "role": clean_role(role)})
 
-                if pos in ["G", "GK", "GARDIEN"]:
-                    if not any(g["nom"] == clean_n for g in gardiens):
-                        gardiens.append(item)
-                else:
-                    if not any(j["nom"] == clean_n for j in joueurs):
-                        joueurs.append(item)
-
-    if not joueurs and not gardiens:
-        staff_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(Entraîneur-Adjoint|Entraîneur-Chef|Entraîneur|Gérant|Préposé)', text)
-        for raw_name, role in staff_matches:
-            clean_n = clean_player_name(raw_name)
-            if clean_n and not any(p["nom"] == clean_n for p in personnel):
-                personnel.append({"nom": clean_n, "role": role})
-
-        player_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(\d{1,2})\s*([FGD]|DG|AG|AD|Gardiens?|Joueurs?)\b', text)
-        for raw_name, num, pos in player_matches:
-            words = [w for w in raw_name.split() if w.upper() not in ["POSITION", "GARDIENS", "JOUEURS", "PERSONNEL", "DE", "L'ÉQUIPE", "POS"]]
-            if not words:
-                continue
-            full_name = clean_player_name(" ".join(words))
-            item = {"nom": full_name, "numero": num, "position": pos}
-            if pos.upper() in ["G", "GARDIEN"] or "GARD" in pos.upper():
-                if not any(g["nom"] == full_name for g in gardiens):
-                    gardiens.append(item)
-            else:
-                if not any(j["nom"] == full_name for j in joueurs):
-                    joueurs.append(item)
-
-    print(f"[PARSING ROSTER] {len(gardiens)} gardien(s), {len(joueurs)} joueur(s), {len(personnel)} membre(s) du personnel trouvés.")
+    print(f"[PARSING ROSTER] {len(gardiens)} gardien(s), {len(joueurs)} joueur(s), {len(personnel)} membre(s) du personnel.")
     return {"gardiens": gardiens, "joueurs": joueurs, "personnel": personnel}
 
+
+# ---------- PARSING SCHEDULE ----------
 
 def parse_schedule_structured(html: str):
     try:
         with open("/data/schedule_debug.html", "w", encoding="utf-8") as f:
             f.write(html)
-        print("[DEBUG FILE] /data/schedule_debug.html écrit.")
-    except Exception as e:
-        print(f"[DEBUG FILE ERROR] {e}")
+    except Exception:
+        pass
 
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    print(f"\n--- [DEBUG SCHEDULE] ---")
-    print(f"Longueur HTML: {len(html)} octets")
-    print(f"Extrait du texte capturé (300 chars):\n{text[:300]}")
-    print(f"------------------------\n")
+    # Regex dates plus permissive (jours optionnels, abréviations, etc.)
+    date_pattern = (
+        r'((?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\s+)?'
+        r'(\d{1,2})\s+'
+        r'(janv\.|janvier|févr\.|février|mars|avr\.|avril|mai|juin|juill\.|juillet|'
+        r'août|sept\.|septembre|oct\.|octobre|nov\.|novembre|déc\.|décembre)\s+'
+        r'(\d{4})'
+    )
+    matches = re.findall(date_pattern, text, re.I)
+    unique_dates = []
+    seen = set()
+    for m in matches:
+        full = " ".join(p for p in m if p).strip()
+        if full and full not in seen:
+            seen.add(full)
+            unique_dates.append(full)
 
-    dates = re.findall(r'((?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)?\s*\d{1,2}\s+(?:janv\.|févr\.|mars|avr\.|mai|juin|juill\.|août|sept\.|oct\.|nov\.|déc\.|janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s+\d{4})', text, re.I)
-    unique_dates = list(dict.fromkeys([d.strip() for d in dates if len(d.strip()) > 5]))
+    # Essayer aussi d'extraire les matchs avec équipes (format "Équipe A vs Équipe B")
+    match_pattern = re.compile(
+        r'(\d{1,2}\s+(?:janv\.|févr\.|mars|avr\.|mai|juin|juill\.|août|sept\.|oct\.|nov\.|déc\.|'
+        r'janvier|février|avril|juillet|septembre|octobre|novembre|décembre)\s+\d{4})'
+        r'[^\d]{0,80}?'
+        r'(\d{1,2}:\d{2})',
+        re.I
+    )
+    games = [{"date": d, "heure": h} for d, h in match_pattern.findall(text)]
 
-    events = [{"date": d, "description": "Match au calendrier"} for d in unique_dates]
-    print(f"[PARSING SCHEDULE] {len(unique_dates)} date(s) de match trouvée(s).")
-    return {"dates_trouvees": unique_dates, "prochains_matchs": events}
+    print(f"[PARSING SCHEDULE] {len(unique_dates)} date(s) unique(s), {len(games)} match(s) avec heure.")
+    return {
+        "dates_trouvees": unique_dates,
+        "matchs": games,
+        "prochains_matchs": games if games else [{"date": d} for d in unique_dates]
+    }
 
+
+# ---------- PARSING STATS ----------
 
 def parse_table_generic(html: str, debug_name: str = "generic"):
     try:
         with open(f"/data/{debug_name}_debug.html", "w", encoding="utf-8") as f:
             f.write(html)
-        print(f"[DEBUG FILE] /data/{debug_name}_debug.html écrit.")
-    except Exception as e:
-        print(f"[DEBUG FILE ERROR] {e}")
+    except Exception:
+        pass
 
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if not table:
         return []
     headers = [th.get_text(strip=True) for th in table.select("thead th")]
-    print(f"[DEBUG {debug_name.upper()}] En-têtes: {headers}")
     rows = []
     for tr in table.select("tbody tr"):
         tds = [td.get_text(strip=True) for td in tr.find_all("td")]
         if len(tds) >= len(headers):
             rows.append(dict(zip(headers, tds)))
-    print(f"[DEBUG {debug_name.upper()}] {len(rows)} ligne(s) extraite(s).")
+    print(f"[PARSING {debug_name.upper()}] {len(rows)} ligne(s) | En-têtes: {headers}")
     return rows
 
 
-def parse_standings(html: str):
+# ---------- PARSING STANDINGS ----------
+
+def parse_standings(html: str, category_uuid: str = None):
+    """
+    Récupère le classement de la bonne catégorie.
+    On essaie de trouver la table dont les lignes contiennent MY_TEAM_NAME.
+    """
     try:
         with open("/data/standings_debug.html", "w", encoding="utf-8") as f:
             f.write(html)
-        print("[DEBUG FILE] /data/standings_debug.html écrit.")
-    except Exception as e:
-        print(f"[DEBUG FILE ERROR] {e}")
+    except Exception:
+        pass
 
     soup = BeautifulSoup(html, "html.parser")
     all_rows = []
-    tables = soup.find_all("table")
-    print(f"[DEBUG STANDINGS] {len(tables)} table(s) trouvée(s).")
-    for t_idx, table in enumerate(tables):
+    best_table_rows = []
+
+    for t_idx, table in enumerate(soup.find_all("table")):
         headers = [th.get_text(strip=True) for th in table.select("thead th")]
-        rows_count = 0
+        if "Équipe" not in headers:
+            continue
+        rows = []
         for tr in table.select("tbody tr"):
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= len(headers):
-                row = dict(zip(headers, tds))
-                all_rows.append(row)
-                rows_count += 1
-        print(f"[DEBUG STANDINGS #{t_idx}] En-têtes: {headers} | {rows_count} ligne(s)")
-    return all_rows
+                rows.append(dict(zip(headers, tds)))
+        if rows:
+            all_rows.extend(rows)
+            # Détecter la table contenant notre équipe
+            for r in rows:
+                if MY_TEAM_NAME in r.get("Équipe", "").upper():
+                    best_table_rows = rows
+                    break
+
+    return all_rows, best_table_rows
 
 
 # ---------- SCRAPING PRINCIPAL ----------
 
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v2.0.1 (FlareSolverr) - Équipe: {MY_TEAM_NAME}")
+    print(f"[START] Scraping RseqHockey v2.1.0 (FlareSolverr) - Équipe: {MY_TEAM_NAME}")
     print(f"==================================================")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -277,26 +339,25 @@ async def scrape_and_publish():
     }
 
     scraped_html = {}
-
     timeout = aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT + 30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for key, url in urls.items():
             html = await fetch_with_flaresolverr(session, url, key)
             scraped_html[key] = html
             if html is None:
-                print(f"[ABORT] Impossible de récupérer '{key}', arrêt du cycle.")
+                print(f"[ABORT] Impossible de récupérer '{key}'.")
                 return
 
     print("\n[PARSING] Traitement des données extraites...")
     roster_data = parse_roster_structured(scraped_html["roster"])
     schedule_data = parse_schedule_structured(scraped_html["schedule"])
     player_stats_sr = parse_table_generic(scraped_html["stats_saison_reguliere"], "stats_saison_reguliere")
-    standings_list = parse_standings(scraped_html["standings"])
+    standings_all, standings_my_team = parse_standings(scraped_html["standings"])
 
-    my_team_info = next((t for t in standings_list if MY_TEAM_NAME in t.get("Équipe", "").upper()), None)
+    my_team_info = next((t for t in standings_all if MY_TEAM_NAME in t.get("Équipe", "").upper()), None)
     player_info_sr = next((p for p in player_stats_sr if TRACKED_PLAYER in p.get("Nom", "").lower()), None) if TRACKED_PLAYER else None
 
-    print("\n[MQTT] Début de la publication sur le broker...")
+    print("\n[MQTT] Publication...")
 
     def build_config(name, object_id, state_topic, attr_topic, icon):
         return {
@@ -310,53 +371,69 @@ async def scrape_and_publish():
         }
 
     def publish_config(topic, cfg):
-        """Debug wrapper pour les configs MQTT Discovery."""
         print(f"\n[MQTT DISCOVERY] {topic}")
-        print(f"[MQTT DISCOVERY] Payload: {json.dumps(cfg, ensure_ascii=False)[:300]}...")
         publish_to_mqtt(topic, cfg)
 
     total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
 
+    # --- Roster ---
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config",
-        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Alignement", f"rseqhockey_{TEAM_ID}_roster", f"rseqhockey/{TEAM_ID}/roster/state", f"rseqhockey/{TEAM_ID}/roster/attributes", "mdi:account-group")
+        build_config(f"RSEQ Alignement {TEAM_ID}", f"rseqhockey_{TEAM_ID}_roster",
+                     f"rseqhockey/{TEAM_ID}/roster/state",
+                     f"rseqhockey/{TEAM_ID}/roster/attributes", "mdi:account-group")
     )
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/state", f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/state",
+                    f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
-    prochain_match = schedule_data["dates_trouvees"][0] if schedule_data["dates_trouvees"] else "Aucun match prévu"
+    # --- Horaire ---
+    prochain_match = schedule_data["prochains_matchs"][0]["date"] if schedule_data["prochains_matchs"] else "Aucun match prévu"
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config",
-        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Horaire", f"rseqhockey_{TEAM_ID}_schedule", f"rseqhockey/{TEAM_ID}/schedule/state", f"rseqhockey/{TEAM_ID}/schedule/attributes", "mdi:calendar-clock")
+        build_config(f"RSEQ Horaire {TEAM_ID}", f"rseqhockey_{TEAM_ID}_schedule",
+                     f"rseqhockey/{TEAM_ID}/schedule/state",
+                     f"rseqhockey/{TEAM_ID}/schedule/attributes", "mdi:calendar-clock")
     )
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", prochain_match)
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", schedule_data)
 
+    # --- Classement ---
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config",
-        build_config(f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}", f"rseqhockey_{TEAM_ID}_standings", f"rseqhockey/{TEAM_ID}/standings/state", f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy")
+        build_config(f"RSEQ Classement {MY_TEAM_NAME.capitalize()}", f"rseqhockey_{TEAM_ID}_standings",
+                     f"rseqhockey/{TEAM_ID}/standings/state",
+                     f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy")
     )
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state", f"{my_team_info.get('#', 'N/A')}e rang" if my_team_info else "Saison en cours")
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes", {"mon_equipe": my_team_info, "classement_complet": standings_list})
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state",
+                    f"{my_team_info.get('#', 'N/A')}e rang" if my_team_info else "Saison en cours")
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes",
+                    {"mon_equipe": my_team_info, "classement_complet": standings_all})
 
+    # --- Joueur suivi ---
     if TRACKED_PLAYER:
         player_slug = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
         pts_sr = player_info_sr.get("PTS", "0") if player_info_sr else "0"
         publish_config(
             f"homeassistant/sensor/rseqhockey_player_{player_slug}/config",
-            build_config(f"RSEQ Hockey Joueur {TRACKED_PLAYER.capitalize()}", f"rseqhockey_player_{player_slug}", f"rseqhockey/player/{player_slug}/state", f"rseqhockey/player/{player_slug}/attributes", "mdi:account-star")
+            build_config(f"RSEQ Joueur {TRACKED_PLAYER.capitalize()}", f"rseqhockey_player_{player_slug}",
+                         f"rseqhockey/player/{player_slug}/state",
+                         f"rseqhockey/player/{player_slug}/attributes", "mdi:account-star")
         )
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/state", f"SR: {pts_sr} pts")
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/attributes", {"stats_saison_reguliere": player_info_sr})
 
+    # --- Stats saison régulière ---
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config",
-        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Stats Saison Reguliere", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks")
+        build_config(f"RSEQ Stats Saison {TEAM_ID}", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere",
+                     f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state",
+                     f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks")
     )
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"{len(player_stats_sr)} joueurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", {"joueurs": player_stats_sr})
 
-    print("\n[FIN] Cycle terminé avec succès.")
+    print("\n[FIN] Cycle terminé.")
 
 
 if __name__ == "__main__":
