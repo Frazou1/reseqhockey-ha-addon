@@ -165,19 +165,31 @@ def parse_standings(html: str):
                 all_rows.append(row)
     return all_rows
 
-async def load_page_with_debug(page, url, key_name):
-    print(f"[SCRAPE] Navigation vers '{key_name}': {url}")
-    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(3000)
-    
-    # Attente dynamique pour la présence d'un tableau HTML ou conteneur Spordle
-    try:
-        await page.wait_for_selector("table, div.spordle-container, div.team-roster", timeout=6000)
-        print(f"[SCRAPE DEBUG '{key_name}'] Composant HTML détecté dans le DOM.")
-    except Exception:
-        print(f"[SCRAPE DEBUG '{key_name}'] Aucun sélecteur spécifique trouvé après 6s, poursuite...")
+async def wait_for_cloudflare(page, timeout_sec=20):
+    for i in range(timeout_sec):
+        title = await page.title()
+        content = await page.content()
+        if "Just a moment" not in title and "security verification" not in content.lower():
+            print(f"[CLOUDFLARE BYPASS] Franchi après {i+1}s (Titre: '{title}')")
+            return True
+        await page.wait_for_timeout(1000)
+    print("[CLOUDFLARE WARN] Défi non franchi avant timeout.")
+    return False
 
-    # Scroll pour forcer le lazy-loading React
+async def load_page_with_debug(page, url, key_name):
+    print(f"\n[SCRAPE] Navigation vers '{key_name}': {url}")
+    await page.goto(url, wait_until="domcontentloaded", timeout=35000)
+    
+    # Attente active de la résolution du challenge Cloudflare
+    await wait_for_cloudflare(page)
+    
+    # Attente complémentaire pour l'hydratation React
+    try:
+        await page.wait_for_selector("table, div.spordle-container, div.team-roster, div.schedule-container", timeout=8000)
+        print(f"[SCRAPE DEBUG '{key_name}'] Composant DOM détecté !")
+    except Exception:
+        print(f"[SCRAPE DEBUG '{key_name}'] Aucun sélecteur spécifique, poursuite...")
+
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
     await page.wait_for_timeout(1000)
     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -190,7 +202,7 @@ async def load_page_with_debug(page, url, key_name):
 
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v1.6.3 (Équipe: {MY_TEAM_NAME})")
+    print(f"[START] Scraping RseqHockey v1.6.4 (Équipe: {MY_TEAM_NAME})")
     print(f"==================================================")
     
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -201,19 +213,32 @@ async def scrape_and_publish():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1280,900"
+            ]
         )
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            locale="fr-CA"
         )
+        
+        # Masquage de l'empreinte d'automatisation
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['fr-CA', 'fr', 'en-US', 'en']});
+        """)
+
         page = await context.new_page()
 
-        # STEP 1 : Navigation initiale et validation cookie
-        print("[SESSION] Initialisation de la session sur RSEQ...")
+        print("[SESSION] Connexion initiale à la plateforme RSEQ...")
         try:
             await page.goto("https://scolaire.rseqhockey.com/fr", wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(2000)
+            await wait_for_cloudflare(page)
             cookie_btn = page.locator("button:has-text('Accepter')").or_(page.locator("button:has-text('Accept')"))
             if await cookie_btn.count() > 0:
                 await cookie_btn.first.click()
@@ -222,7 +247,6 @@ async def scrape_and_publish():
         except Exception as e:
             print(f"[SESSION NOTE] {e}")
 
-        # STEP 2 : Chargement des 4 URLs
         scraped_html["roster"] = await load_page_with_debug(page, f"{team_url}?tab=roster", "roster")
         scraped_html["schedule"] = await load_page_with_debug(page, f"{team_url}?tab=schedule", "schedule")
         scraped_html["standings"] = await load_page_with_debug(page, f"{team_url}?tab=standings", "standings")
@@ -254,27 +278,23 @@ async def scrape_and_publish():
             "device": DEVICE_INFO
         }
 
-    # 1. Alignement
     total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config", 
         build_config(f"RSEQ Hockey Équipe {TEAM_ID} Alignement", f"rseqhockey_{TEAM_ID}_roster", f"rseqhockey/{TEAM_ID}/roster/state", f"rseqhockey/{TEAM_ID}/roster/attributes", "mdi:account-group"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/state", f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
-    # 2. Horaire
     prochain_match = schedule_data["dates_trouvees"][0] if schedule_data["dates_trouvees"] else "Aucun match prévu"
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config", 
         build_config(f"RSEQ Hockey Équipe {TEAM_ID} Horaire", f"rseqhockey_{TEAM_ID}_schedule", f"rseqhockey/{TEAM_ID}/schedule/state", f"rseqhockey/{TEAM_ID}/schedule/attributes", "mdi:calendar-clock"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", prochain_match)
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", schedule_data)
 
-    # 3. Classement
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config", 
-        build_config(f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}", f"rseqhockey_{TEAM_ID}_standings", f"rseqhockey/{TEAM_ID}/standings/state", f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy"))
+        build_config(f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}", f"rseqhockey_{TEAM_ID}_standings", f"rseqhockey/{TEAM_ID}_standings/state", f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state", f"{my_team_info.get('#', 'N/A')}e rang" if my_team_info else "Saison en cours")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes", {"mon_equipe": my_team_info, "classement_complet": standings_list})
 
-    # 4. Joueur Suivi
     if TRACKED_PLAYER:
         player_slug = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
         pts_sr = player_info_sr.get("PTS", "0") if player_info_sr else "0"
@@ -283,7 +303,6 @@ async def scrape_and_publish():
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/state", f"SR: {pts_sr} pts")
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/attributes", {"stats_saison_reguliere": player_info_sr})
 
-    # 5. Stats
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config", 
         build_config(f"RSEQ Hockey Équipe {TEAM_ID} Stats Saison Reguliere", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"{len(player_stats_sr)} joueurs")
