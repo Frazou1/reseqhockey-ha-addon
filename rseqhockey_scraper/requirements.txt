@@ -1,5 +1,5 @@
-playwright==1.63.0
-pandas
+aiohttp
+beautifulsoup4
 paho-mqtt
 requests
-beautifulsoup4
+pandas
