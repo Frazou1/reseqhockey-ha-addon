@@ -65,14 +65,23 @@ def clean_player_name(name: str) -> str:
 
 def parse_roster_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    
+    print(f"\n--- [DEBUG ROSTER] ---")
+    print(f"Longueur HTML: {len(html)} octets")
+    print(f"Nombre de balises <table>: {len(soup.find_all('table'))}")
+    print(f"Extrait du texte capturé (300 chars):\n{text[:300]}")
+    print(f"----------------------\n")
+
     gardiens = []
     joueurs = []
     personnel = []
 
-    # Recherche directe dans le DOM hydraté (balises table ou spans React)
+    # 1. Parsing par balises <table> HTML
     tables = soup.find_all("table")
-    for table in tables:
+    for t_idx, table in enumerate(tables):
         rows = table.select("tbody tr")
+        print(f"[DEBUG ROSTER TABLE #{t_idx}] {len(rows)} ligne(s) dans le tableau")
         for tr in rows:
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= 2:
@@ -89,16 +98,14 @@ def parse_roster_structured(html: str):
                     if not any(j["nom"] == clean_n for j in joueurs):
                         joueurs.append(item)
 
-    # Méthode Regex universelle sur tout le texte du DOM Spordle/RSEQ
+    # 2. Parsing de secours par Regex
     if not joueurs and not gardiens:
-        text = soup.get_text(" ")
         staff_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(Entraîneur-Adjoint|Entraîneur-Chef|Entraîneur|Gérant|Préposé)', text)
         for raw_name, role in staff_matches:
             clean_n = clean_player_name(raw_name)
             if clean_n and not any(p["nom"] == clean_n for p in personnel):
                 personnel.append({"nom": clean_n, "role": role})
 
-        # Capture des noms de joueurs avec leur numéro et position
         player_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(\d{1,2})\s*([FGD]|DG|AG|AD|Gardiens?|Joueurs?)\b', text)
         for raw_name, num, pos in player_matches:
             words = [w for w in raw_name.split() if w.upper() not in ["POSITION", "GARDIENS", "JOUEURS", "PERSONNEL", "DE", "L'ÉQUIPE", "POS"]]
@@ -118,8 +125,13 @@ def parse_roster_structured(html: str):
 
 def parse_schedule_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ")
+    text = soup.get_text(" ", strip=True)
     
+    print(f"\n--- [DEBUG SCHEDULE] ---")
+    print(f"Longueur HTML: {len(html)} octets")
+    print(f"Extrait du texte capturé (300 chars):\n{text[:300]}")
+    print(f"------------------------\n")
+
     dates = re.findall(r'((?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)?\s*\d{1,2}\s+(?:janv\.|févr\.|mars|avr\.|mai|juin|juill\.|août|sept\.|oct\.|nov\.|déc\.|janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s+\d{4})', text, re.I)
     unique_dates = list(dict.fromkeys([d.strip() for d in dates if len(d.strip()) > 5]))
     
@@ -153,9 +165,32 @@ def parse_standings(html: str):
                 all_rows.append(row)
     return all_rows
 
+async def load_page_with_debug(page, url, key_name):
+    print(f"[SCRAPE] Navigation vers '{key_name}': {url}")
+    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    await page.wait_for_timeout(3000)
+    
+    # Attente dynamique pour la présence d'un tableau HTML ou conteneur Spordle
+    try:
+        await page.wait_for_selector("table, div.spordle-container, div.team-roster", timeout=6000)
+        print(f"[SCRAPE DEBUG '{key_name}'] Composant HTML détecté dans le DOM.")
+    except Exception:
+        print(f"[SCRAPE DEBUG '{key_name}'] Aucun sélecteur spécifique trouvé après 6s, poursuite...")
+
+    # Scroll pour forcer le lazy-loading React
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+    await page.wait_for_timeout(1000)
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(2000)
+
+    content = await page.content()
+    title = await page.title()
+    print(f"[SCRAPE OK '{key_name}'] Titre: '{title}' | Taille HTML: {len(content)} octets")
+    return content
+
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v1.6.2 (Équipe: {MY_TEAM_NAME})")
+    print(f"[START] Scraping RseqHockey v1.6.3 (Équipe: {MY_TEAM_NAME})")
     print(f"==================================================")
     
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -174,55 +209,26 @@ async def scrape_and_publish():
         )
         page = await context.new_page()
 
-        # STEP 1 : Navigation initiale sur le site racine RSEQ pour valider Cloudflare & récupérer le Cookie
-        print("[SESSION] Connexion initiale à la plateforme RSEQ...")
+        # STEP 1 : Navigation initiale et validation cookie
+        print("[SESSION] Initialisation de la session sur RSEQ...")
         try:
             await page.goto("https://scolaire.rseqhockey.com/fr", wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
             cookie_btn = page.locator("button:has-text('Accepter')").or_(page.locator("button:has-text('Accept')"))
             if await cookie_btn.count() > 0:
                 await cookie_btn.first.click()
-                print("[SESSION] Cookie Cloudflare / Spordle validé.")
+                print("[SESSION] Cookies acceptés.")
                 await page.wait_for_timeout(1000)
         except Exception as e:
             print(f"[SESSION NOTE] {e}")
 
-        # STEP 2 : Chargement de la page de l'équipe unique dans LE MÊME context
-        print(f"[SCRAPE] Naviguer vers la fiche de l'équipe {TEAM_ID}...")
-        await page.goto(team_url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(4000)
+        # STEP 2 : Chargement des 4 URLs
+        scraped_html["roster"] = await load_page_with_debug(page, f"{team_url}?tab=roster", "roster")
+        scraped_html["schedule"] = await load_page_with_debug(page, f"{team_url}?tab=schedule", "schedule")
+        scraped_html["standings"] = await load_page_with_debug(page, f"{team_url}?tab=standings", "standings")
         
-        # Scroll pour forcer l'hydratation du composant Roster de Next.js
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-        await page.wait_for_timeout(1500)
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1500)
-        scraped_html["roster"] = await page.content()
-
-        # STEP 3 : Onglet Horaire (via navigation interne pour garder la session hydratée)
-        print("[SCRAPE] Chargement de 'schedule'...")
-        await page.goto(f"{team_url}?tab=schedule", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(4000)
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1500)
-        scraped_html["schedule"] = await page.content()
-
-        # STEP 4 : Onglet Standings
-        print("[SCRAPE] Chargement de 'standings'...")
-        await page.goto(f"{team_url}?tab=standings", wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(4000)
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1500)
-        scraped_html["standings"] = await page.content()
-
-        # STEP 5 : Page Stats Saison Régulière
-        print("[SCRAPE] Chargement des statistiques de saison régulière...")
-        stats_full_url = f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats"
-        await page.goto(stats_full_url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(4000)
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1500)
-        scraped_html["stats_saison_reguliere"] = await page.content()
+        stats_url = f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats"
+        scraped_html["stats_saison_reguliere"] = await load_page_with_debug(page, stats_url, "stats_saison_reguliere")
 
         await browser.close()
 
