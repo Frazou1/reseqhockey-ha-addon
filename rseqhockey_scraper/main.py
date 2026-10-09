@@ -37,7 +37,7 @@ if os.path.exists("/config/www") and not os.path.exists(WWW_LOGOS_DIR):
 DEVICE_INFO = {
     "identifiers": [f"rseqhockey_team_{TEAM_ID}"],
     "name": f"RSEQ Hockey Équipe {TEAM_ID}",
-    "model": "RSEQ Hockey Scraper",
+    "model": "RSEQ Scraper",
     "manufacturer": "Spordle / RSEQ"
 }
 
@@ -65,32 +65,38 @@ def clean_player_name(name: str) -> str:
 
 def parse_roster_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ")
+    
+    print(f"[DEBUG ROSTER] Longueur HTML: {len(html)} chars | Tables trouvées: {len(soup.find_all('table'))}")
+    print(f"[DEBUG ROSTER EXTRAIT]: {text[:250]}...")
+
     gardiens = []
     joueurs = []
     personnel = []
 
+    # 1. Extraction par tableaux HTML
     tables = soup.find_all("table")
-    for table in tables:
+    for t_idx, table in enumerate(tables):
         rows = table.select("tbody tr")
+        print(f"[DEBUG ROSTER TABLE #{t_idx}] {len(rows)} ligne(s) détectée(s)")
         for tr in rows:
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= 3:
                 raw_name = tds[0]
                 num = tds[1] if tds[1].isdigit() else ""
                 pos = tds[2].upper()
-                
                 clean_n = clean_player_name(raw_name)
                 item = {"nom": clean_n, "numero": num, "position": pos}
                 
                 if pos in ["G", "GK", "GARDIEN"]:
                     if not any(g["nom"] == clean_n for g in gardiens):
                         gardiens.append(item)
-                elif pos in ["F", "D", "AG", "AD", "C", "DG"]:
+                else:
                     if not any(j["nom"] == clean_n for j in joueurs):
                         joueurs.append(item)
 
+    # 2. Méthode Regex de secours
     if not joueurs and not gardiens:
-        text = soup.get_text(" ")
         staff_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(Entraîneur-Adjoint|Entraîneur-Chef|Entraîneur|Gérant|Préposé)', text)
         for raw_name, role in staff_matches:
             clean_n = clean_player_name(raw_name)
@@ -118,6 +124,9 @@ def parse_schedule_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ")
     
+    print(f"[DEBUG SCHEDULE] Longueur HTML: {len(html)} chars")
+    print(f"[DEBUG SCHEDULE EXTRAIT]: {text[:250]}...")
+
     dates = re.findall(r'((?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)?\s*\d{1,2}\s+(?:janv\.|févr\.|mars|avr\.|mai|juin|juill\.|août|sept\.|oct\.|nov\.|déc\.|janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s+\d{4})', text, re.I)
     unique_dates = list(dict.fromkeys([d.strip() for d in dates if len(d.strip()) > 5]))
     
@@ -156,26 +165,9 @@ def parse_standings(html: str):
                 all_rows.append(row)
     return all_rows
 
-def download_logos(soup: BeautifulSoup):
-    images = soup.find_all("img")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'}
-    for img in images:
-        src = img.get("src", "")
-        alt = img.get("alt", "").strip()
-        if src.startswith("http") and ("team" in src or "logo" in src or len(alt) > 2):
-            clean_name = re.sub(r'[^a-zA-Z0-9]', '_', alt if alt else src.split("/")[-1]).lower()
-            file_path = os.path.join(LOGOS_DIR, f"{clean_name}.png")
-            if not os.path.exists(file_path):
-                try:
-                    req = urllib.request.Request(src, headers=headers)
-                    with urllib.request.urlopen(req) as response, open(file_path, 'wb') as out_file:
-                        out_file.write(response.read())
-                except Exception:
-                    pass
-
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey (Équipe: {MY_TEAM_NAME})")
+    print(f"[START] Scraping RseqHockey v1.6.0 (Équipe: {MY_TEAM_NAME})")
     print(f"==================================================")
     
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -213,21 +205,17 @@ async def scrape_and_publish():
             try:
                 print(f"[SCRAPE] Chargement de '{key}' ({url})...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(3500)
-                
-                try:
-                    await page.wait_for_selector("table", timeout=5000)
-                except Exception:
-                    pass
+                await page.wait_for_timeout(4000)
 
+                # Scroll progressif
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
                 await page.wait_for_timeout(1000)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(2000)
 
                 html_content = await page.content()
                 scraped_html[key] = html_content
-                download_logos(BeautifulSoup(html_content, "html.parser"))
+                print(f"[SCRAPE OK] '{key}' chargé ({len(html_content)} octets)")
             except Exception as e:
                 print(f"[SCRAPE ERROR] Échec sur {key}: {e}")
                 scraped_html[key] = ""
@@ -245,64 +233,50 @@ async def scrape_and_publish():
 
     print("\n[MQTT] Début de la publication sur le broker...")
 
+    # Configuration MQTT Discovery robuste
+    def build_config(name, object_id, state_topic, attr_topic, icon):
+        return {
+            "name": name,
+            "object_id": object_id,
+            "unique_id": object_id,
+            "state_topic": state_topic,
+            "json_attributes_topic": attr_topic,
+            "icon": icon,
+            "device": DEVICE_INFO
+        }
+
+    # 1. Alignement
     total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
-    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config", {
-        "name": f"RSEQ Hockey Équipe {TEAM_ID} Alignement",
-        "unique_id": f"rseqhockey_team_{TEAM_ID}_roster",
-        "state_topic": f"rseqhockey/{TEAM_ID}/roster/state",
-        "json_attributes_topic": f"rseqhockey/{TEAM_ID}/roster/attributes",
-        "icon": "mdi:account-group",
-        "device": DEVICE_INFO
-    })
+    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config", 
+        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Alignement", f"rseqhockey_{TEAM_ID}_roster", f"rseqhockey/{TEAM_ID}/roster/state", f"rseqhockey/{TEAM_ID}/roster/attributes", "mdi:account-group"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/state", f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
+    # 2. Horaire
     prochain_match = schedule_data["dates_trouvees"][0] if schedule_data["dates_trouvees"] else "Aucun match prévu"
-    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config", {
-        "name": f"RSEQ Hockey Équipe {TEAM_ID} Horaire",
-        "unique_id": f"rseqhockey_team_{TEAM_ID}_schedule",
-        "state_topic": f"rseqhockey/{TEAM_ID}/schedule/state",
-        "json_attributes_topic": f"rseqhockey/{TEAM_ID}/schedule/attributes",
-        "icon": "mdi:calendar-clock",
-        "device": DEVICE_INFO
-    })
+    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config", 
+        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Horaire", f"rseqhockey_{TEAM_ID}_schedule", f"rseqhockey/{TEAM_ID}/schedule/state", f"rseqhockey/{TEAM_ID}/schedule/attributes", "mdi:calendar-clock"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", prochain_match)
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", schedule_data)
 
-    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config", {
-        "name": f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}",
-        "unique_id": f"rseqhockey_team_{TEAM_ID}_standings",
-        "state_topic": f"rseqhockey/{TEAM_ID}/standings/state",
-        "json_attributes_topic": f"rseqhockey/{TEAM_ID}/standings/attributes",
-        "icon": "mdi:trophy",
-        "device": DEVICE_INFO
-    })
+    # 3. Classement
+    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config", 
+        build_config(f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}", f"rseqhockey_{TEAM_ID}_standings", f"rseqhockey/{TEAM_ID}/standings/state", f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state", f"{my_team_info.get('#', 'N/A')}e rang" if my_team_info else "Saison en cours")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes", {"mon_equipe": my_team_info, "classement_complet": standings_list})
 
+    # 4. Joueur Suivi
     if TRACKED_PLAYER:
         player_slug = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
         pts_sr = player_info_sr.get("PTS", "0") if player_info_sr else "0"
-        
-        publish_to_mqtt(f"homeassistant/sensor/rseqhockey_player_{player_slug}/config", {
-            "name": f"RSEQ Hockey Joueur {TRACKED_PLAYER.capitalize()}",
-            "unique_id": f"rseqhockey_player_{player_slug}",
-            "state_topic": f"rseqhockey/player/{player_slug}/state",
-            "json_attributes_topic": f"rseqhockey/player/{player_slug}/attributes",
-            "icon": "mdi:account-star",
-            "device": DEVICE_INFO
-        })
+        publish_to_mqtt(f"homeassistant/sensor/rseqhockey_player_{player_slug}/config", 
+            build_config(f"RSEQ Hockey Joueur {TRACKED_PLAYER.capitalize()}", f"rseqhockey_player_{player_slug}", f"rseqhockey/player/{player_slug}/state", f"rseqhockey/player/{player_slug}/attributes", "mdi:account-star"))
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/state", f"SR: {pts_sr} pts")
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/attributes", {"stats_saison_reguliere": player_info_sr})
 
-    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config", {
-        "name": f"RSEQ Hockey Équipe {TEAM_ID} Stats Saison Reguliere",
-        "unique_id": f"rseqhockey_team_{TEAM_ID}_stats_saison_reguliere",
-        "state_topic": f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state",
-        "json_attributes_topic": f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes",
-        "icon": "mdi:hockey-sticks",
-        "device": DEVICE_INFO
-    })
+    # 5. Stats
+    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config", 
+        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Stats Saison Reguliere", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"{len(player_stats_sr)} joueurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", {"joueurs": player_stats_sr})
 
