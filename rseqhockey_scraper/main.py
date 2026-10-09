@@ -20,9 +20,8 @@ MQTT_USER = config.get("mqtt_user", "")
 MQTT_PASS = config.get("mqtt_password", "")
 INTERVAL = config.get("update_interval_hours", 6) * 3600
 
-# --- FlareSolverr ---
 FLARESOLVERR_URL = config.get("flaresolverr_url", "http://192.168.2.65:8191/v1")
-FLARESOLVERR_TIMEOUT = config.get("flaresolverr_timeout", 90)  # en secondes
+FLARESOLVERR_TIMEOUT = config.get("flaresolverr_timeout", 90)
 
 LEAGUE_UUID = "ae5bed83-a302-4ac5-927b-639d2c20a3c9"
 SCHEDULE_SAISON_REGULIERE = "198862"
@@ -47,7 +46,6 @@ DEVICE_INFO = {
 # ---------- FLARESOLVERR ----------
 
 async def fetch_with_flaresolverr(session, url, key_name):
-    """Récupère le HTML d'une URL via FlareSolverr (bypass Cloudflare)."""
     print(f"\n[FLARESOLVERR] Requête '{key_name}': {url}")
     payload = {
         "cmd": "request.get",
@@ -72,7 +70,6 @@ async def fetch_with_flaresolverr(session, url, key_name):
         print(f"[FLARESOLVERR ERROR '{key_name}'] Réponse vide.")
         return None
 
-    # Vérification défensive : est-ce que Cloudflare est encore dans la page ?
     lower = html.lower()
     if "vérification de sécurité en cours" in lower or "just a moment" in lower:
         print(f"[FLARESOLVERR WARN '{key_name}'] Page challenge détectée malgré status ok.")
@@ -94,7 +91,11 @@ def publish_to_mqtt(topic, payload):
         client.username_pw_set(MQTT_USER, MQTT_PASS)
     try:
         client.connect(MQTT_HOST, int(MQTT_PORT), keepalive=10)
-        client.publish(topic, json.dumps(payload, ensure_ascii=False), retain=True)
+        result = client.publish(topic, json.dumps(payload, ensure_ascii=False), retain=True)
+        # Debug : vérifier que la publication s'est bien passée
+        result.wait_for_publish(timeout=5)
+        if result.rc != 0:
+            print(f"[MQTT WARN] rc={result.rc} sur {topic}")
         client.disconnect()
         print(f"[MQTT SUCCESS] Publié sur: {topic}")
     except Exception as e:
@@ -111,6 +112,14 @@ def clean_player_name(name: str) -> str:
 
 
 def parse_roster_structured(html: str):
+    # --- DEBUG : sauvegarde du HTML brut ---
+    try:
+        with open("/data/roster_debug.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        print("[DEBUG FILE] /data/roster_debug.html écrit.")
+    except Exception as e:
+        print(f"[DEBUG FILE ERROR] {e}")
+
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
@@ -128,6 +137,15 @@ def parse_roster_structured(html: str):
     for t_idx, table in enumerate(tables):
         rows = table.select("tbody tr")
         print(f"[DEBUG ROSTER TABLE #{t_idx}] {len(rows)} ligne(s) dans le tableau")
+
+        # --- DEBUG : afficher les en-têtes et les 3 premières lignes ---
+        headers = [th.get_text(strip=True) for th in table.select("thead th")]
+        if headers:
+            print(f"   EN-TÊTES: {headers}")
+        for tr_dbg in rows[:3]:
+            tds_dbg = [td.get_text(strip=True) for td in tr_dbg.find_all("td")]
+            print(f"   Ligne brute: {tds_dbg}")
+
         for tr in rows:
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= 2:
@@ -170,6 +188,13 @@ def parse_roster_structured(html: str):
 
 
 def parse_schedule_structured(html: str):
+    try:
+        with open("/data/schedule_debug.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        print("[DEBUG FILE] /data/schedule_debug.html écrit.")
+    except Exception as e:
+        print(f"[DEBUG FILE ERROR] {e}")
+
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
@@ -186,31 +211,51 @@ def parse_schedule_structured(html: str):
     return {"dates_trouvees": unique_dates, "prochains_matchs": events}
 
 
-def parse_table_generic(html: str):
+def parse_table_generic(html: str, debug_name: str = "generic"):
+    try:
+        with open(f"/data/{debug_name}_debug.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"[DEBUG FILE] /data/{debug_name}_debug.html écrit.")
+    except Exception as e:
+        print(f"[DEBUG FILE ERROR] {e}")
+
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table")
     if not table:
         return []
     headers = [th.get_text(strip=True) for th in table.select("thead th")]
+    print(f"[DEBUG {debug_name.upper()}] En-têtes: {headers}")
     rows = []
     for tr in table.select("tbody tr"):
         tds = [td.get_text(strip=True) for td in tr.find_all("td")]
         if len(tds) >= len(headers):
             rows.append(dict(zip(headers, tds)))
+    print(f"[DEBUG {debug_name.upper()}] {len(rows)} ligne(s) extraite(s).")
     return rows
 
 
 def parse_standings(html: str):
+    try:
+        with open("/data/standings_debug.html", "w", encoding="utf-8") as f:
+            f.write(html)
+        print("[DEBUG FILE] /data/standings_debug.html écrit.")
+    except Exception as e:
+        print(f"[DEBUG FILE ERROR] {e}")
+
     soup = BeautifulSoup(html, "html.parser")
     all_rows = []
     tables = soup.find_all("table")
-    for table in tables:
+    print(f"[DEBUG STANDINGS] {len(tables)} table(s) trouvée(s).")
+    for t_idx, table in enumerate(tables):
         headers = [th.get_text(strip=True) for th in table.select("thead th")]
+        rows_count = 0
         for tr in table.select("tbody tr"):
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= len(headers):
                 row = dict(zip(headers, tds))
                 all_rows.append(row)
+                rows_count += 1
+        print(f"[DEBUG STANDINGS #{t_idx}] En-têtes: {headers} | {rows_count} ligne(s)")
     return all_rows
 
 
@@ -218,7 +263,7 @@ def parse_standings(html: str):
 
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v2.0.0 (FlareSolverr) - Équipe: {MY_TEAM_NAME}")
+    print(f"[START] Scraping RseqHockey v2.0.1 (FlareSolverr) - Équipe: {MY_TEAM_NAME}")
     print(f"==================================================")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -233,20 +278,19 @@ async def scrape_and_publish():
 
     scraped_html = {}
 
-    # Timeout global côté client aiohttp (le vrai timeout est géré par FlareSolverr)
     timeout = aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT + 30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for key, url in urls.items():
             html = await fetch_with_flaresolverr(session, url, key)
             scraped_html[key] = html
             if html is None:
-                print(f"[ABORT] Impossible de récupérer '{key}', arrêt du cycle pour ne pas publier de données incomplètes.")
+                print(f"[ABORT] Impossible de récupérer '{key}', arrêt du cycle.")
                 return
 
     print("\n[PARSING] Traitement des données extraites...")
     roster_data = parse_roster_structured(scraped_html["roster"])
     schedule_data = parse_schedule_structured(scraped_html["schedule"])
-    player_stats_sr = parse_table_generic(scraped_html["stats_saison_reguliere"])
+    player_stats_sr = parse_table_generic(scraped_html["stats_saison_reguliere"], "stats_saison_reguliere")
     standings_list = parse_standings(scraped_html["standings"])
 
     my_team_info = next((t for t in standings_list if MY_TEAM_NAME in t.get("Équipe", "").upper()), None)
@@ -265,33 +309,50 @@ async def scrape_and_publish():
             "device": DEVICE_INFO
         }
 
+    def publish_config(topic, cfg):
+        """Debug wrapper pour les configs MQTT Discovery."""
+        print(f"\n[MQTT DISCOVERY] {topic}")
+        print(f"[MQTT DISCOVERY] Payload: {json.dumps(cfg, ensure_ascii=False)[:300]}...")
+        publish_to_mqtt(topic, cfg)
+
     total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
-    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config",
-        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Alignement", f"rseqhockey_{TEAM_ID}_roster", f"rseqhockey/{TEAM_ID}/roster/state", f"rseqhockey/{TEAM_ID}/roster/attributes", "mdi:account-group"))
+
+    publish_config(
+        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config",
+        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Alignement", f"rseqhockey_{TEAM_ID}_roster", f"rseqhockey/{TEAM_ID}/roster/state", f"rseqhockey/{TEAM_ID}/roster/attributes", "mdi:account-group")
+    )
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/state", f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
     prochain_match = schedule_data["dates_trouvees"][0] if schedule_data["dates_trouvees"] else "Aucun match prévu"
-    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config",
-        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Horaire", f"rseqhockey_{TEAM_ID}_schedule", f"rseqhockey/{TEAM_ID}/schedule/state", f"rseqhockey/{TEAM_ID}/schedule/attributes", "mdi:calendar-clock"))
+    publish_config(
+        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config",
+        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Horaire", f"rseqhockey_{TEAM_ID}_schedule", f"rseqhockey/{TEAM_ID}/schedule/state", f"rseqhockey/{TEAM_ID}/schedule/attributes", "mdi:calendar-clock")
+    )
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", prochain_match)
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", schedule_data)
 
-    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config",
-        build_config(f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}", f"rseqhockey_{TEAM_ID}_standings", f"rseqhockey/{TEAM_ID}/standings/state", f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy"))
+    publish_config(
+        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config",
+        build_config(f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}", f"rseqhockey_{TEAM_ID}_standings", f"rseqhockey/{TEAM_ID}/standings/state", f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy")
+    )
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state", f"{my_team_info.get('#', 'N/A')}e rang" if my_team_info else "Saison en cours")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes", {"mon_equipe": my_team_info, "classement_complet": standings_list})
 
     if TRACKED_PLAYER:
         player_slug = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
         pts_sr = player_info_sr.get("PTS", "0") if player_info_sr else "0"
-        publish_to_mqtt(f"homeassistant/sensor/rseqhockey_player_{player_slug}/config",
-            build_config(f"RSEQ Hockey Joueur {TRACKED_PLAYER.capitalize()}", f"rseqhockey_player_{player_slug}", f"rseqhockey/player/{player_slug}/state", f"rseqhockey/player/{player_slug}/attributes", "mdi:account-star"))
+        publish_config(
+            f"homeassistant/sensor/rseqhockey_player_{player_slug}/config",
+            build_config(f"RSEQ Hockey Joueur {TRACKED_PLAYER.capitalize()}", f"rseqhockey_player_{player_slug}", f"rseqhockey/player/{player_slug}/state", f"rseqhockey/player/{player_slug}/attributes", "mdi:account-star")
+        )
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/state", f"SR: {pts_sr} pts")
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/attributes", {"stats_saison_reguliere": player_info_sr})
 
-    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config",
-        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Stats Saison Reguliere", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks"))
+    publish_config(
+        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config",
+        build_config(f"RSEQ Hockey Équipe {TEAM_ID} Stats Saison Reguliere", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks")
+    )
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"{len(player_stats_sr)} joueurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", {"joueurs": player_stats_sr})
 
