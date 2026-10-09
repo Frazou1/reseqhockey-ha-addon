@@ -69,15 +69,16 @@ def parse_roster_structured(html: str):
     joueurs = []
     personnel = []
 
+    # Recherche directe dans le DOM hydraté (balises table ou spans React)
     tables = soup.find_all("table")
     for table in tables:
         rows = table.select("tbody tr")
         for tr in rows:
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-            if len(tds) >= 3:
+            if len(tds) >= 2:
                 raw_name = tds[0]
-                num = tds[1] if tds[1].isdigit() else ""
-                pos = tds[2].upper()
+                num = tds[1] if tds[1].isdigit() else (tds[2] if len(tds) > 2 and tds[2].isdigit() else "")
+                pos = tds[-1].upper() if len(tds) >= 3 else "F"
                 clean_n = clean_player_name(raw_name)
                 item = {"nom": clean_n, "numero": num, "position": pos}
                 
@@ -88,6 +89,7 @@ def parse_roster_structured(html: str):
                     if not any(j["nom"] == clean_n for j in joueurs):
                         joueurs.append(item)
 
+    # Méthode Regex universelle sur tout le texte du DOM Spordle/RSEQ
     if not joueurs and not gardiens:
         text = soup.get_text(" ")
         staff_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(Entraîneur-Adjoint|Entraîneur-Chef|Entraîneur|Gérant|Préposé)', text)
@@ -96,6 +98,7 @@ def parse_roster_structured(html: str):
             if clean_n and not any(p["nom"] == clean_n for p in personnel):
                 personnel.append({"nom": clean_n, "role": role})
 
+        # Capture des noms de joueurs avec leur numéro et position
         player_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(\d{1,2})\s*([FGD]|DG|AG|AD|Gardiens?|Joueurs?)\b', text)
         for raw_name, num, pos in player_matches:
             words = [w for w in raw_name.split() if w.upper() not in ["POSITION", "GARDIENS", "JOUEURS", "PERSONNEL", "DE", "L'ÉQUIPE", "POS"]]
@@ -147,96 +150,79 @@ def parse_standings(html: str):
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= len(headers):
                 row = dict(zip(headers, tds))
-                img = tr.find("img")
-                if img and img.get("src"):
-                    team_name = row.get("Équipe", "").strip()
-                    clean_filename = re.sub(r'[^a-zA-Z0-9]', '_', team_name).lower() + ".png"
-                    row["logo_url"] = f"/local/rseqhockey_logos/{clean_filename}"
                 all_rows.append(row)
     return all_rows
 
-async def bypass_cloudflare_and_load(page, url):
-    print(f"[SCRAPE] Chargement de {url}...")
-    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    
-    # Attente active du franchissement du challenge Cloudflare
-    for attempt in range(10):
-        content = await page.content()
-        if "Just a moment" not in content and "security verification" not in content:
-            print(f"[CLOUDFLARE BYPASS] Validation réussie après {attempt*2}s !")
-            break
-        print("[CLOUDFLARE] Attente de la vérification de sécurité...")
-        await page.wait_for_timeout(2000)
-
-    await page.wait_for_timeout(3000)
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-    await page.wait_for_timeout(1000)
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await page.wait_for_timeout(1500)
-    return await page.content()
-
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v1.6.1 (Équipe: {MY_TEAM_NAME})")
+    print(f"[START] Scraping RseqHockey v1.6.2 (Équipe: {MY_TEAM_NAME})")
     print(f"==================================================")
     
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
-    team_base_url = f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}"
+    team_url = f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}"
 
     scraped_html = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--disable-web-security"
-            ]
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
         )
         context = await browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            locale="fr-CA"
+            viewport={"width": 1280, "height": 900},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
         )
         page = await context.new_page()
 
-        # Étape 1 : Passer Cloudflare sur la page principale de l'équipe
-        await bypass_cloudflare_and_load(page, team_base_url)
+        # STEP 1 : Navigation initiale sur le site racine RSEQ pour valider Cloudflare & récupérer le Cookie
+        print("[SESSION] Connexion initiale à la plateforme RSEQ...")
+        try:
+            await page.goto("https://scolaire.rseqhockey.com/fr", wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+            cookie_btn = page.locator("button:has-text('Accepter')").or_(page.locator("button:has-text('Accept')"))
+            if await cookie_btn.count() > 0:
+                await cookie_btn.first.click()
+                print("[SESSION] Cookie Cloudflare / Spordle validé.")
+                await page.wait_for_timeout(1000)
+        except Exception as e:
+            print(f"[SESSION NOTE] {e}")
+
+        # STEP 2 : Chargement de la page de l'équipe unique dans LE MÊME context
+        print(f"[SCRAPE] Naviguer vers la fiche de l'équipe {TEAM_ID}...")
+        await page.goto(team_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+        
+        # Scroll pour forcer l'hydratation du composant Roster de Next.js
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+        await page.wait_for_timeout(1500)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(1500)
         scraped_html["roster"] = await page.content()
 
-        # Étape 2 : Cliquer sur l'onglet Schedule s'il existe, sinon recharger l'URL direct
-        try:
-            schedule_tab = page.locator("text=Horaire").or_(page.locator("text=Schedule")).or_(page.locator("a[href*='tab=schedule']"))
-            if await schedule_tab.count() > 0:
-                print("[NAVIGATION] Clic sur l'onglet Horaire...")
-                await schedule_tab.first.click()
-                await page.wait_for_timeout(3000)
-                scraped_html["schedule"] = await page.content()
-            else:
-                scraped_html["schedule"] = await bypass_cloudflare_and_load(page, f"{team_base_url}?tab=schedule")
-        except Exception as e:
-            print(f"[SCHEDULE NAV NOTE] {e}")
-            scraped_html["schedule"] = await bypass_cloudflare_and_load(page, f"{team_base_url}?tab=schedule")
+        # STEP 3 : Onglet Horaire (via navigation interne pour garder la session hydratée)
+        print("[SCRAPE] Chargement de 'schedule'...")
+        await page.goto(f"{team_url}?tab=schedule", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(1500)
+        scraped_html["schedule"] = await page.content()
 
-        # Étape 3 : Standings
-        try:
-            standings_tab = page.locator("text=Classement").or_(page.locator("text=Standings")).or_(page.locator("a[href*='tab=standings']"))
-            if await standings_tab.count() > 0:
-                print("[NAVIGATION] Clic sur l'onglet Classement...")
-                await standings_tab.first.click()
-                await page.wait_for_timeout(3000)
-                scraped_html["standings"] = await page.content()
-            else:
-                scraped_html["standings"] = await bypass_cloudflare_and_load(page, f"{team_base_url}?tab=standings")
-        except Exception as e:
-            print(f"[STANDINGS NAV NOTE] {e}")
-            scraped_html["standings"] = await bypass_cloudflare_and_load(page, f"{team_base_url}?tab=standings")
+        # STEP 4 : Onglet Standings
+        print("[SCRAPE] Chargement de 'standings'...")
+        await page.goto(f"{team_url}?tab=standings", wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(1500)
+        scraped_html["standings"] = await page.content()
 
-        # Étape 4 : Stats Saison Régulière
-        stats_url = f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats"
-        scraped_html["stats_saison_reguliere"] = await bypass_cloudflare_and_load(page, stats_url)
+        # STEP 5 : Page Stats Saison Régulière
+        print("[SCRAPE] Chargement des statistiques de saison régulière...")
+        stats_full_url = f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats"
+        await page.goto(stats_full_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(4000)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(1500)
+        scraped_html["stats_saison_reguliere"] = await page.content()
 
         await browser.close()
 
