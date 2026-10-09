@@ -170,11 +170,13 @@ async def scrape_and_publish():
     
     urls_to_scrape = {
         "roster": f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}",
-        "schedule": f"https://scolaire.rseqhockey.com/fr/teams/TEAM_ID}?tab=schedule",
+        "schedule": f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}?tab=schedule",
         "standings": f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}?tab=standings",
-        "stats_hors_concours": f"{base_url}?scheduleId={SCHEDULE_HORS_CONCOURS}&tab=playerstats",
         "stats_saison_reguliere": f"{base_url}?scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats"
     }
+    
+    if SCHEDULE_HORS_CONCOURS:
+        urls_to_scrape["stats_hors_concours"] = f"{base_url}?scheduleId={SCHEDULE_HORS_CONCOURS}&tab=playerstats"
 
     scraped_html = {}
 
@@ -203,7 +205,6 @@ async def scrape_and_publish():
                 print(f"[SCRAPE] Chargement de '{key}'...")
                 await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 
-                # Attente dynamique spécifique pour l'onglet Roster
                 if key == "roster":
                     try:
                         await page.wait_for_selector("text=Position", timeout=8000)
@@ -226,73 +227,82 @@ async def scrape_and_publish():
     print("\n[PARSING] Traitement des données extraites...")
     roster_data = parse_roster_structured(scraped_html.get("roster", ""))
     schedule_data = parse_schedule_structured(scraped_html.get("schedule", ""))
-    player_stats_hc = parse_table_generic(scraped_html.get("stats_hors_concours", ""))
+    player_stats_hc = parse_table_generic(scraped_html.get("stats_hors_concours", "")) if SCHEDULE_HORS_CONCOURS else []
     player_stats_sr = parse_table_generic(scraped_html.get("stats_saison_reguliere", ""))
     standings_list = parse_standings(scraped_html.get("standings", ""))
 
     my_team_info = next((t for t in standings_list if MY_TEAM_NAME in t.get("Équipe", "").upper()), None)
-    player_info_hc = next((p for p in player_stats_hc if TRACKED_PLAYER in p.get("Nom", "").lower()), None) if TRACKED_PLAYER else None
+    player_info_hc = next((p for p in player_stats_hc if TRACKED_PLAYER in p.get("Nom", "").lower()), None) if TRACKED_PLAYER and player_stats_hc else None
     player_info_sr = next((p for p in player_stats_sr if TRACKED_PLAYER in p.get("Nom", "").lower()), None) if TRACKED_PLAYER else None
 
     print("\n[MQTT] Début de la publication sur le broker...")
 
+    # 1. Alignement (Roster)
     total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config", {
-        "name": f"RseqHockey Équipe {TEAM_ID} Alignement",
-        "unique_id": f"RseqHockey_team_{TEAM_ID}_roster",
-        "state_topic": f"RseqHockey/{TEAM_ID}/roster/state",
-        "json_attributes_topic": f"RseqHockey/{TEAM_ID}/roster/attributes",
+        "name": f"RSEQ Hockey Équipe {TEAM_ID} Alignement",
+        "unique_id": f"rseqhockey_team_{TEAM_ID}_roster",
+        "state_topic": f"rseqhockey/{TEAM_ID}/roster/state",
+        "json_attributes_topic": f"rseqhockey/{TEAM_ID}/roster/attributes",
         "icon": "mdi:account-group"
     })
-    publish_to_mqtt(f"RseqHockey/{TEAM_ID}/roster/state", f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
-    publish_to_mqtt(f"RseqHockey/{TEAM_ID}/roster/attributes", roster_data)
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/state", f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
+    # 2. Horaire (Schedule)
     prochain_match = schedule_data["dates_trouvees"][0] if schedule_data["dates_trouvees"] else "Aucun match prévu"
-    publish_to_mqtt(f"homeassistant/sensor/RseqHockey_{TEAM_ID}_schedule/config", {
-        "name": f"RseqHockey Équipe {TEAM_ID} Horaire",
-        "unique_id": f"spordle_team_{TEAM_ID}_schedule",
-        "state_topic": f"spordle/{TEAM_ID}/schedule/state",
-        "json_attributes_topic": f"spordle/{TEAM_ID}/schedule/attributes",
+    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config", {
+        "name": f"RSEQ Hockey Équipe {TEAM_ID} Horaire",
+        "unique_id": f"rseqhockey_team_{TEAM_ID}_schedule",
+        "state_topic": f"rseqhockey/{TEAM_ID}/schedule/state",
+        "json_attributes_topic": f"rseqhockey/{TEAM_ID}/schedule/attributes",
         "icon": "mdi:calendar-clock"
     })
-    publish_to_mqtt(f"spordle/{TEAM_ID}/schedule/state", prochain_match)
-    publish_to_mqtt(f"spordle/{TEAM_ID}/schedule/attributes", schedule_data)
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", prochain_match)
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", schedule_data)
 
-    publish_to_mqtt(f"homeassistant/sensor/spordle_{TEAM_ID}_standings/config", {
-        "name": f"Spordle Classement {MY_TEAM_NAME.capitalize()}",
-        "unique_id": f"spordle_team_{TEAM_ID}_standings",
-        "state_topic": f"spordle/{TEAM_ID}/standings/state",
-        "json_attributes_topic": f"spordle/{TEAM_ID}/standings/attributes",
+    # 3. Classement
+    publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config", {
+        "name": f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}",
+        "unique_id": f"rseqhockey_team_{TEAM_ID}_standings",
+        "state_topic": f"rseqhockey/{TEAM_ID}/standings/state",
+        "json_attributes_topic": f"rseqhockey/{TEAM_ID}/standings/attributes",
         "icon": "mdi:trophy"
     })
-    publish_to_mqtt(f"spordle/{TEAM_ID}/standings/state", f"{my_team_info.get('#', 'N/A')}e rang" if my_team_info else "Saison en cours")
-    publish_to_mqtt(f"spordle/{TEAM_ID}/standings/attributes", {"mon_equipe": my_team_info, "classement_complet": standings_list})
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state", f"{my_team_info.get('#', 'N/A')}e rang" if my_team_info else "Saison en cours")
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes", {"mon_equipe": my_team_info, "classement_complet": standings_list})
 
+    # 4. Joueur Suivi
     if TRACKED_PLAYER:
         player_slug = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
         pts_hc = player_info_hc.get("PTS", "0") if player_info_hc else "0"
         pts_sr = player_info_sr.get("PTS", "0") if player_info_sr else "0"
         
-        publish_to_mqtt(f"homeassistant/sensor/spordle_player_{player_slug}/config", {
-            "name": f"Spordle Joueur {TRACKED_PLAYER.capitalize()}",
-            "unique_id": f"spordle_player_{player_slug}",
-            "state_topic": f"spordle/player/{player_slug}/state",
-            "json_attributes_topic": f"spordle/player/{player_slug}/attributes",
+        publish_to_mqtt(f"homeassistant/sensor/rseqhockey_player_{player_slug}/config", {
+            "name": f"RSEQ Hockey Joueur {TRACKED_PLAYER.capitalize()}",
+            "unique_id": f"rseqhockey_player_{player_slug}",
+            "state_topic": f"rseqhockey/player/{player_slug}/state",
+            "json_attributes_topic": f"rseqhockey/player/{player_slug}/attributes",
             "icon": "mdi:account-star"
         })
-        publish_to_mqtt(f"spordle/player/{player_slug}/state", f"SR: {pts_sr} pts | HC: {pts_hc} pts")
-        publish_to_mqtt(f"spordle/player/{player_slug}/attributes", {"stats_saison_reguliere": player_info_sr, "stats_hors_concours": player_info_hc})
+        publish_to_mqtt(f"rseqhockey/player/{player_slug}/state", f"SR: {pts_sr} pts | HC: {pts_hc} pts")
+        publish_to_mqtt(f"rseqhockey/player/{player_slug}/attributes", {"stats_saison_reguliere": player_info_sr, "stats_hors_concours": player_info_hc})
 
-    for key, data_list in [("stats_hors_concours", player_stats_hc), ("stats_saison_reguliere", player_stats_sr)]:
-        publish_to_mqtt(f"homeassistant/sensor/spordle_{TEAM_ID}_{key}/config", {
-            "name": f"Spordle Équipe {TEAM_ID} {key.replace('_', ' ').capitalize()}",
-            "unique_id": f"spordle_team_{TEAM_ID}_{key}",
-            "state_topic": f"spordle/{TEAM_ID}/{key}/state",
-            "json_attributes_topic": f"spordle/{TEAM_ID}/{key}/attributes",
+    # 5. Stats d'Équipe (Saison Régulière & Hors-Concours si présente)
+    stats_to_publish = [("stats_saison_reguliere", player_stats_sr)]
+    if SCHEDULE_HORS_CONCOURS:
+        stats_to_publish.append(("stats_hors_concours", player_stats_hc))
+
+    for key, data_list in stats_to_publish:
+        publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_{key}/config", {
+            "name": f"RSEQ Hockey Équipe {TEAM_ID} {key.replace('_', ' ').capitalize()}",
+            "unique_id": f"rseqhockey_team_{TEAM_ID}_{key}",
+            "state_topic": f"rseqhockey/{TEAM_ID}/{key}/state",
+            "json_attributes_topic": f"rseqhockey/{TEAM_ID}/{key}/attributes",
             "icon": "mdi:hockey-sticks"
         })
-        publish_to_mqtt(f"spordle/{TEAM_ID}/{key}/state", f"{len(data_list)} joueurs")
-        publish_to_mqtt(f"spordle/{TEAM_ID}/{key}/attributes", {"joueurs": data_list})
+        publish_to_mqtt(f"rseqhockey/{TEAM_ID}/{key}/state", f"{len(data_list)} joueurs")
+        publish_to_mqtt(f"rseqhockey/{TEAM_ID}/{key}/attributes", {"joueurs": data_list})
 
     print("\n[FIN] Cycle terminé avec succès.")
 
