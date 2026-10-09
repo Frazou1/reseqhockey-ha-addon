@@ -1,6 +1,6 @@
 name: "RSEQ Hockey Scraper"
-description: "Récupère les statistiques, l'horaire et les logos du RSEQ Hockey pour Home Assistant."
-version: "1.6.7"
+description: "Récupère les statistiques, l'horaire et les logos du RSEQ Hockey pour Home Assistant via FlareSolverr."
+version: "2.0.0"
 slug: "rseqhockey_scraper"
 init: false
 arch:
@@ -18,6 +18,8 @@ options:
   mqtt_port: 1883
   mqtt_user: ""
   mqtt_password: ""
+  flaresolverr_url: "http://192.168.2.65:8191/v1"
+  flaresolverr_timeout: 90
 schema:
   team_id: str
   team_name: str
@@ -27,3 +29,5 @@ schema:
   mqtt_port: int
   mqtt_user: str?
   mqtt_password: str?
+  flaresolverr_url: str
+  flaresolverr_timeout: int
