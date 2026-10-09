@@ -69,14 +69,12 @@ def parse_roster_structured(html: str):
     joueurs = []
     personnel = []
 
-    # 1. Extraction par tableaux HTML (méthode privilégiée)
     tables = soup.find_all("table")
     for table in tables:
         rows = table.select("tbody tr")
         for tr in rows:
             tds = [td.get_text(strip=True) for td in tr.find_all("td")]
             if len(tds) >= 3:
-                # Format type : [Nom, Numéro, Position]
                 raw_name = tds[0]
                 num = tds[1] if tds[1].isdigit() else ""
                 pos = tds[2].upper()
@@ -91,17 +89,14 @@ def parse_roster_structured(html: str):
                     if not any(j["nom"] == clean_n for j in joueurs):
                         joueurs.append(item)
 
-    # 2. Méthode de secours par texte Regex si les balises <table> ne sont pas utilisées
     if not joueurs and not gardiens:
         text = soup.get_text(" ")
-        # Recherche du personnel
         staff_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(Entraîneur-Adjoint|Entraîneur-Chef|Entraîneur|Gérant|Préposé)', text)
         for raw_name, role in staff_matches:
             clean_n = clean_player_name(raw_name)
             if clean_n and not any(p["nom"] == clean_n for p in personnel):
                 personnel.append({"nom": clean_n, "role": role})
 
-        # Recherche des joueurs
         player_matches = re.findall(r'([A-Za-zÀ-ÖØ-öø-ÿ\s\-]{3,30}?)\s*(\d{1,2})\s*([FGD]|DG|AG|AD|Gardiens?|Joueurs?)\b', text)
         for raw_name, num, pos in player_matches:
             words = [w for w in raw_name.split() if w.upper() not in ["POSITION", "GARDIENS", "JOUEURS", "PERSONNEL", "DE", "L'ÉQUIPE", "POS"]]
@@ -123,7 +118,6 @@ def parse_schedule_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ")
     
-    # Capture des dates complètes (ex: samedi 10 octobre 2026 ou 10 oct. 2026)
     dates = re.findall(r'((?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)?\s*\d{1,2}\s+(?:janv\.|févr\.|mars|avr\.|mai|juin|juill\.|août|sept\.|oct\.|nov\.|déc\.|janvier|février|mars|avril|mai|juin|juillet|août|septembre|octobre|novembre|décembre)\s+\d{4})', text, re.I)
     unique_dates = list(dict.fromkeys([d.strip() for d in dates if len(d.strip()) > 5]))
     
@@ -218,13 +212,13 @@ async def scrape_and_publish():
         for key, url in urls_to_scrape.items():
             try:
                 print(f"[SCRAPE] Chargement de '{key}' ({url})...")
-                await page.goto(url, wait_until="networkidle", timeout=30000)
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(3500)
                 
-                # Attente dynamique sur la présence d'un tableau HTML
                 try:
-                    await page.wait_for_selector("table", timeout=8000)
+                    await page.wait_for_selector("table", timeout=5000)
                 except Exception:
-                    print(f"[{key.upper()} NOTE] Aucun tableau détecté immédiatement, poursuite du défilement...")
+                    pass
 
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
                 await page.wait_for_timeout(1000)
@@ -251,7 +245,6 @@ async def scrape_and_publish():
 
     print("\n[MQTT] Début de la publication sur le broker...")
 
-    # 1. Alignement (Roster)
     total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config", {
         "name": f"RSEQ Hockey Équipe {TEAM_ID} Alignement",
@@ -264,7 +257,6 @@ async def scrape_and_publish():
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/state", f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
-    # 2. Horaire (Schedule)
     prochain_match = schedule_data["dates_trouvees"][0] if schedule_data["dates_trouvees"] else "Aucun match prévu"
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config", {
         "name": f"RSEQ Hockey Équipe {TEAM_ID} Horaire",
@@ -277,7 +269,6 @@ async def scrape_and_publish():
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", prochain_match)
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", schedule_data)
 
-    # 3. Classement
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config", {
         "name": f"RSEQ Hockey Classement {MY_TEAM_NAME.capitalize()}",
         "unique_id": f"rseqhockey_team_{TEAM_ID}_standings",
@@ -289,7 +280,6 @@ async def scrape_and_publish():
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state", f"{my_team_info.get('#', 'N/A')}e rang" if my_team_info else "Saison en cours")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes", {"mon_equipe": my_team_info, "classement_complet": standings_list})
 
-    # 4. Joueur Suivi
     if TRACKED_PLAYER:
         player_slug = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
         pts_sr = player_info_sr.get("PTS", "0") if player_info_sr else "0"
@@ -305,7 +295,6 @@ async def scrape_and_publish():
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/state", f"SR: {pts_sr} pts")
         publish_to_mqtt(f"rseqhockey/player/{player_slug}/attributes", {"stats_saison_reguliere": player_info_sr})
 
-    # 5. Stats Saison Régulière
     publish_to_mqtt(f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config", {
         "name": f"RSEQ Hockey Équipe {TEAM_ID} Stats Saison Reguliere",
         "unique_id": f"rseqhockey_team_{TEAM_ID}_stats_saison_reguliere",
