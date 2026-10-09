@@ -13,6 +13,8 @@ options:
   team_id: "179927"
   team_name: "ÉCOLE SEC. DE LA SEIGNEURIE"
   tracked_player: "Fraser"
+  season_start: "2026-09-19"
+  season_end: "2027-04-01"
   update_interval_hours: 6
   mqtt_host: "core-mosquitto"
   mqtt_port: 1883
@@ -24,6 +26,8 @@ schema:
   team_id: str
   team_name: str
   tracked_player: str?
+  season_start: str?
+  season_end: str?
   update_interval_hours: int
   mqtt_host: str
   mqtt_port: int
