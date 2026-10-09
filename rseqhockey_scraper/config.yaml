@@ -1,6 +1,6 @@
 name: "RSEQ Hockey Scraper"
 description: "Récupère les statistiques, l'horaire et les logos du RSEQ Hockey pour Home Assistant via FlareSolverr."
-version: "2.0.6"
+version: "2.0.7"
 slug: "rseqhockey_scraper"
 init: false
 arch:
