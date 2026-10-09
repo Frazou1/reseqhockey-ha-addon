@@ -99,39 +99,24 @@ def publish_to_mqtt(topic, payload):
 # ---------- HELPERS ----------
 
 def split_name_and_number(raw: str) -> tuple:
-    """
-    Découpe une chaîne du type 'AAANNABELLEMICHAUD35' en ('ANNABELLE MICHAUD', '35').
-    Le HTML de Spordle concatène prénom + nom + numéro sans séparateur,
-    avec parfois des lettres dupliquées parasites au début (ex: 'AAA', 'EEE').
-    """
     raw = raw.strip()
     if not raw:
         return "", ""
 
-    # 1. Extraire le numéro à la fin
     num_match = re.search(r'(\d+)$', raw)
     numero = num_match.group(1) if num_match else ""
     name_part = raw[:num_match.start()] if num_match else raw
 
-    # 2. Nettoyer les lettres dupliquées parasites au début (AAA, EEE, etc.)
-    #    Ex: 'AAANNABELLE' -> 'ANNABELLE', 'EEELLIOT' -> 'ELLIOT'
     name_part = re.sub(r'^(.)\1+', r'\1', name_part, count=1)
 
-    # 3. Séparer prénom/nom : on cherche une majuscule après au moins 2 minuscules
-    #    Ex: 'ANNABELLEMICHAUD' -> 'ANNABELLE MICHAUD'
-    #    Astuce : on insère un espace avant toute majuscule qui suit une minuscule
-    #    ou avant une séquence majuscule qui termine un prénom
     parts = re.split(r'(?<=[a-zéèêëàâäîïôöùûüç])(?=[A-ZÉÈÊËÀÂÄÎÏÔÖÙÛÜÇ])', name_part)
     if len(parts) >= 2:
-        # Regrouper : tout sauf le dernier = prénom, dernier = nom
         prenom = parts[0]
         nom = " ".join(parts[1:])
         full_name = f"{prenom} {nom}"
     else:
-        # Fallback : tout en majuscules sans séparation détectable, on garde tel quel
         full_name = name_part
 
-    # 4. Normaliser les espaces
     full_name = re.sub(r'\s+', ' ', full_name).strip()
     return full_name, numero
 
@@ -161,7 +146,6 @@ def parse_roster_structured(html: str):
 
         header_set = set(h.lower() for h in headers)
 
-        # --- Table des GARDIENS ---
         if "gardiens" in header_set:
             print(f"[ROSTER] Table #{t_idx} = GARDIENS")
             for tr in table.select("tbody tr"):
@@ -172,13 +156,8 @@ def parse_roster_structured(html: str):
                 if not full_name:
                     continue
                 stats = dict(zip(headers, tds))
-                gardiens.append({
-                    "nom": full_name,
-                    "numero": numero,
-                    "stats": stats
-                })
+                gardiens.append({"nom": full_name, "numero": numero, "stats": stats})
 
-        # --- Table des JOUEURS ---
         elif "joueurs" in header_set:
             print(f"[ROSTER] Table #{t_idx} = JOUEURS")
             for tr in table.select("tbody tr"):
@@ -189,13 +168,8 @@ def parse_roster_structured(html: str):
                 if not full_name:
                     continue
                 stats = dict(zip(headers, tds))
-                joueurs.append({
-                    "nom": full_name,
-                    "numero": numero,
-                    "stats": stats
-                })
+                joueurs.append({"nom": full_name, "numero": numero, "stats": stats})
 
-        # --- Table du PERSONNEL ---
         elif any("personnel" in h.lower() for h in headers):
             print(f"[ROSTER] Table #{t_idx} = PERSONNEL")
             for tr in table.select("tbody tr"):
@@ -204,7 +178,6 @@ def parse_roster_structured(html: str):
                     continue
                 raw_name = tds[0]
                 role = tds[1]
-                # Même format collé : 'AALEXIS HOULE' -> 'ALEXIS HOULE'
                 name_clean = re.sub(r'^(.)\1+', r'\1', raw_name.strip(), count=1)
                 name_clean = re.sub(r'\s+', ' ', name_clean).strip()
                 if name_clean:
@@ -214,7 +187,31 @@ def parse_roster_structured(html: str):
     return {"gardiens": gardiens, "joueurs": joueurs, "personnel": personnel}
 
 
-# ---------- PARSING SCHEDULE ----------
+# ---------- PARSING SCHEDULE (V2 - aréna + heure + équipes) ----------
+
+# Regex précompilées pour la performance
+_RE_DATE = re.compile(
+    r'((?:LUN|MAR|MER|JEU|VEN|SAM|DIM)\.?\s+\d{1,2}\s+'
+    r'(?:JANV|FÉVR|FÉV|MARS|AVR|MAI|JUIN|JUIL|AOÛT|SEPT|OCT|NOV|DÉC)\.?'
+    r'(?:\s+\d{2,4})?)',
+    re.I
+)
+_RE_HEURE = re.compile(r'(\d{1,2})\s*[Hh]\s*(\d{2})')
+_RE_ARENA = re.compile(
+    r'((?:Aréna|Arena|Centre|Complexe)[^|•\n]{0,100}?)'
+    r'(?=\s*(?:SAISON|M\d|D\d|RELÈVE|MIXTE|\d{1,2}\s*[Hh]|$))',
+    re.I
+)
+_RE_EQUIPE = re.compile(r'\b([A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ][A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ\-\'\. ]{3,60})\b')
+
+_BLACKLIST_EQUIPES = {
+    "SAISON RÉGULIÈRE", "SAISON REGULIERE", "SAISON", "RÉGULIÈRE",
+    "M13", "M15", "M18", "D1", "D2", "D3",
+    "RELÈVE", "RELEVE", "MIXTE", "HOCKEY", "RSEQ", "LIGUE",
+    "VEN", "LUN", "MAR", "MER", "JEU", "SAM", "DIM",
+    "JANV", "FÉVR", "MARS", "AVR", "JUIN", "JUIL", "AOÛT", "SEPT", "OCT", "NOV", "DÉC",
+}
+
 
 def parse_schedule_structured(html: str):
     try:
@@ -224,40 +221,106 @@ def parse_schedule_structured(html: str):
         pass
 
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
+    matchs = []
 
-    # Regex dates plus permissive (jours optionnels, abréviations, etc.)
-    date_pattern = (
-        r'((?:lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\s+)?'
-        r'(\d{1,2})\s+'
-        r'(janv\.|janvier|févr\.|février|mars|avr\.|avril|mai|juin|juill\.|juillet|'
-        r'août|sept\.|septembre|oct\.|octobre|nov\.|novembre|déc\.|décembre)\s+'
-        r'(\d{4})'
-    )
-    matches = re.findall(date_pattern, text, re.I)
-    unique_dates = []
-    seen = set()
-    for m in matches:
-        full = " ".join(p for p in m if p).strip()
-        if full and full not in seen:
-            seen.add(full)
-            unique_dates.append(full)
+    # --- 1. Repérer les blocs candidats ---
+    candidates = []
+    for selector in [
+        "div.game-card", "div.match-card", "div.schedule-game",
+        "div[class*='game']", "div[class*='match']",
+        "div[class*='Game']", "div[class*='Match']",
+        "article[class*='game']", "li[class*='game']",
+    ]:
+        found = soup.select(selector)
+        if found:
+            candidates.extend(found)
 
-    # Essayer aussi d'extraire les matchs avec équipes (format "Équipe A vs Équipe B")
-    match_pattern = re.compile(
-        r'(\d{1,2}\s+(?:janv\.|févr\.|mars|avr\.|mai|juin|juill\.|août|sept\.|oct\.|nov\.|déc\.|'
-        r'janvier|février|avril|juillet|septembre|octobre|novembre|décembre)\s+\d{4})'
-        r'[^\d]{0,80}?'
-        r'(\d{1,2}:\d{2})',
-        re.I
-    )
-    games = [{"date": d, "heure": h} for d, h in match_pattern.findall(text)]
+    # Fallback : remonter depuis chaque aréna
+    if not candidates:
+        for tag in soup.find_all(string=_RE_ARENA):
+            parent = tag.find_parent()
+            if parent:
+                for _ in range(5):
+                    if parent.parent:
+                        parent = parent.parent
+                candidates.append(parent)
 
-    print(f"[PARSING SCHEDULE] {len(unique_dates)} date(s) unique(s), {len(games)} match(s) avec heure.")
+    # Déduplication par id()
+    seen_ids = set()
+    unique_candidates = []
+    for c in candidates:
+        cid = id(c)
+        if cid not in seen_ids:
+            seen_ids.add(cid)
+            unique_candidates.append(c)
+
+    print(f"[SCHEDULE] {len(unique_candidates)} bloc(s) candidat(s) analysé(s).")
+
+    # --- 2. Parser chaque bloc ---
+    for block in unique_candidates:
+        text = block.get_text(" ", strip=True)
+        if not text or len(text) > 3000:
+            continue
+
+        date_m = _RE_DATE.search(text)
+        heure_m = _RE_HEURE.search(text)
+        if not date_m or not heure_m:
+            continue
+
+        date_str = date_m.group(1).strip()
+        heure_str = f"{heure_m.group(1)}h{heure_m.group(2)}"
+
+        # Aréna
+        arena = ""
+        arena_m = _RE_ARENA.search(text)
+        if arena_m:
+            arena = re.sub(r'\s+', ' ', arena_m.group(1)).strip().rstrip(',-')
+
+        # Équipes : candidats en MAJUSCULES
+        equipes = []
+        for em in _RE_EQUIPE.finditer(text):
+            candidate = em.group(1).strip()
+            if len(candidate) < 4:
+                continue
+            if any(bl in candidate for bl in _BLACKLIST_EQUIPES):
+                continue
+            if any(bl == candidate for bl in _BLACKLIST_EQUIPES):
+                continue
+            # Éviter les doublons
+            if candidate not in equipes:
+                equipes.append(candidate)
+
+        # Garder les 2 plus longs comme équipes
+        equipes_sorted = sorted(set(equipes), key=len, reverse=True)[:2]
+
+        matchs.append({
+            "date": date_str,
+            "heure": heure_str,
+            "arene": arena,
+            "equipes": equipes_sorted,
+            "texte_brut": text[:200]
+        })
+
+    # Déduplication par (date + heure + arène)
+    unique_matchs = []
+    seen_keys = set()
+    for m in matchs:
+        key = (m["date"], m["heure"], m["arene"])
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_matchs.append(m)
+
+    # Extraction fallback des dates (pour ne rien perdre)
+    all_dates = list(dict.fromkeys([m["date"] for m in unique_matchs]))
+
+    print(f"[PARSING SCHEDULE] {len(unique_matchs)} match(s) extrait(s).")
+    for m in unique_matchs[:5]:
+        print(f"   → {m['date']} {m['heure']} | {m['arene']} | {m['equipes']}")
+
     return {
-        "dates_trouvees": unique_dates,
-        "matchs": games,
-        "prochains_matchs": games if games else [{"date": d} for d in unique_dates]
+        "matchs": unique_matchs,
+        "dates_trouvees": all_dates,
+        "prochains_matchs": unique_matchs,
     }
 
 
@@ -287,10 +350,6 @@ def parse_table_generic(html: str, debug_name: str = "generic"):
 # ---------- PARSING STANDINGS ----------
 
 def parse_standings(html: str, category_uuid: str = None):
-    """
-    Récupère le classement de la bonne catégorie.
-    On essaie de trouver la table dont les lignes contiennent MY_TEAM_NAME.
-    """
     try:
         with open("/data/standings_debug.html", "w", encoding="utf-8") as f:
             f.write(html)
@@ -312,7 +371,6 @@ def parse_standings(html: str, category_uuid: str = None):
                 rows.append(dict(zip(headers, tds)))
         if rows:
             all_rows.extend(rows)
-            # Détecter la table contenant notre équipe
             for r in rows:
                 if MY_TEAM_NAME in r.get("Équipe", "").upper():
                     best_table_rows = rows
@@ -325,7 +383,7 @@ def parse_standings(html: str, category_uuid: str = None):
 
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v2.1.0 (FlareSolverr) - Équipe: {MY_TEAM_NAME}")
+    print(f"[START] Scraping RseqHockey v2.2.0 (FlareSolverr) - Équipe: {MY_TEAM_NAME}")
     print(f"==================================================")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -387,15 +445,20 @@ async def scrape_and_publish():
                     f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
-    # --- Horaire ---
-    prochain_match = schedule_data["prochains_matchs"][0]["date"] if schedule_data["prochains_matchs"] else "Aucun match prévu"
+    # --- Horaire (state enrichi : date + heure + aréna) ---
+    if schedule_data["prochains_matchs"]:
+        next_m = schedule_data["prochains_matchs"][0]
+        prochain_match_state = f"{next_m['date']} {next_m['heure']} - {next_m['arene'] or 'Aréna inconnu'}"
+    else:
+        prochain_match_state = "Aucun match prévu"
+
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config",
         build_config(f"RSEQ Horaire {TEAM_ID}", f"rseqhockey_{TEAM_ID}_schedule",
                      f"rseqhockey/{TEAM_ID}/schedule/state",
                      f"rseqhockey/{TEAM_ID}/schedule/attributes", "mdi:calendar-clock")
     )
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", prochain_match)
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", prochain_match_state)
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", schedule_data)
 
     # --- Classement ---
