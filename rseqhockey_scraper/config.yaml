@@ -1,0 +1,29 @@
+name: "RSEQ Hockey Scraper"
+description: "Récupère les statistiques, l'horaire et les logos Spordle pour Home Assistant."
+version: "1.4.2
+slug: "rseqhockey_scraper"
+init: false
+arch:
+  - amd64
+  - aarch64
+map:
+  - share:rw
+  - config:rw
+options:
+  team_id: "179927"
+  team_name: "ÉCOLE SEC. DE LA SEIGNEURIE"
+  tracked_player: "Fraser"
+  update_interval_hours: 6
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+schema:
+  team_id: str
+  team_name: str
+  tracked_player: str?
+  update_interval_hours: int
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_user: str?
+  mqtt_password: str?
