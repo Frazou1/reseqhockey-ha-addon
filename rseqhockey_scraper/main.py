@@ -163,7 +163,7 @@ def download_logos(soup: BeautifulSoup):
 
 async def scrape_and_publish():
     print(f"\n==================================================")
-    print(f"[START] Scraping RseqHockey v1.4.2 (Équipe: {MY_TEAM_NAME})")
+    print(f"[START] Scraping RseqHockey v1.5.2 (Équipe: {MY_TEAM_NAME})")
     print(f"==================================================")
     
     base_url = f"https://scolaire.rseqhockey.com/fr/-rseq/schedule-stats-standings/{LEAGUE_UUID}"
