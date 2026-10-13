@@ -492,77 +492,64 @@ def parse_schedule_cards(html: str):
 # PARSING ROSTER
 # ============================================================
 
-def _clean_name(raw: str):
+def _extract_name_from_cell(td):
     """
-    Nettoie un nom en retirant la 1ère lettre parasite de Spordle.
-    Ex: 'AAANNABELLEMICHAUD35' → ('ANNABELLEMICHAUD', '35')
-        'AALEXIS HOULE' → 'ALEXIS HOULE'
+    Extrait un nom propre depuis une cellule <td>.
+    Spordle utilise : <div title="PRÉNOM NOM"><a>PRÉNOM NOM</a></div>
     """
-    raw = raw.strip()
-    if not raw:
-        return "", ""
+    # Stratégie 1 : attribut title sur un div
+    for div in td.find_all("div"):
+        title = div.get("title", "").strip()
+        if title and len(title) > 2 and not title.isdigit():
+            return title
 
-    # Retirer numéro
-    num_match = re.search(r'(\d+)$', raw)
-    numero = num_match.group(1) if num_match else ""
-    name_part = raw[:num_match.start()] if num_match else raw
+    # Stratégie 2 : attribut title sur un span
+    for sp in td.find_all("span"):
+        title = sp.get("title", "").strip()
+        if title and len(title) > 2 and not title.isdigit():
+            return title
 
-    # Retirer UNE seule lettre parasite (le 1er caractère si dupliqué au 2e)
-    if len(name_part) >= 2 and name_part[0] == name_part[1]:
-        name_part = name_part[1:]
+    # Stratégie 3 : balise <a> (contient le nom complet)
+    a = td.find("a")
+    if a:
+        txt = a.get_text(strip=True)
+        if txt and len(txt) > 2 and not txt.isdigit():
+            return txt
 
-    return name_part.strip(), numero
+    # Stratégie 4 : span avec class text-truncate (utilisé pour le personnel)
+    sp = td.find("span", class_=re.compile("text-truncate", re.I))
+    if sp:
+        txt = sp.get_text(strip=True)
+        if txt and len(txt) > 2:
+            return txt
+
+    return ""
 
 
-def _split_prenom_nom(name_upper: str):
+def _extract_number_from_cell(td_name, td_num):
     """
-    Sépare 'ANNABELLEMICHAUD' en 'ANNABELLE MICHAUD'.
-    Utilise une liste de prénoms québécois courants + heuristiques.
+    Extrait le numéro. Spordle le met généralement dans la 2e cellule
+    (<td>35</td>) ou dans un span du nom.
     """
-    # Premiers indices : séparer sur tiret (ex: LOUIS-PHILIPPEDROUIN)
-    if '-' in name_upper:
-        idx = name_upper.index('-')
-        # Trouver la fin du prénom composé (après le prochain segment en majuscules)
-        # Ex: LOUIS-PHILIPPEDROUIN → LOUIS-PHILIPPE + DROUIN
-        m = re.match(r'^([A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ]+-[A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ]+)([A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ].*)$', name_upper)
+    # Stratégie 1 : dans le td suivant
+    txt = td_num.get_text(strip=True)
+    if txt and txt.isdigit():
+        return txt
+
+    # Stratégie 2 : dans un span du td du nom
+    for sp in td_name.find_all("span"):
+        txt = sp.get_text(strip=True)
+        if txt and txt.isdigit():
+            return txt
+
+    # Stratégie 3 : extraire du title du div (ex: "ANNABELLE MICHAUD 35")
+    for div in td_name.find_all("div"):
+        title = div.get("title", "")
+        m = re.search(r'\s(\d{1,2})$', title)
         if m:
-            return m.group(1), m.group(2)
+            return m.group(1)
 
-    # Liste de prénoms fréquents (extensible)
-    PRENOMS = [
-        "ANNABELLE", "ADAM", "ANTOINE", "ELLIOT", "JACOB", "JAKOB",
-        "JOUEUR2", "LOUIS-PHILIPPE", "LOUIS", "LYAM", "MILAN", "OLIVIER",
-        "THOMAS", "VICTOR", "ALEXIS", "BRYAN", "FELIX", "GABRIEL",
-        "JÉRÉMY", "MATHIAS", "PASCAL", "RENAUD", "ROMAIN", "SYLVAIN",
-        "SAMUEL", "LUCAS", "NATHAN", "WILLIAM", "EMMANUEL", "RAPHAEL",
-        "ANTHONY", "CHARLES", "DAVID", "ÉRIC", "FRÉDÉRIC", "HUGO",
-        "ISAAC", "JULIEN", "KEVIN", "LÉO", "MARC", "NICOLAS", "PIERRE",
-        "SIMON", "VINCENT", "XAVIER", "ZACHARY",
-    ]
-
-    for prenom in sorted(PRENOMS, key=len, reverse=True):
-        if name_upper.startswith(prenom) and len(name_upper) > len(prenom):
-            return prenom, name_upper[len(prenom):]
-
-    # Heuristique : prénoms québécois = souvent 4-8 lettres
-    # On coupe après 4-8 lettres selon une recherche de frontière plausible
-    for split_at in range(8, 3, -1):
-        if len(name_upper) > split_at:
-            return name_upper[:split_at], name_upper[split_at:]
-
-    # Fallback : tout en un seul mot
-    return name_upper, ""
-
-
-def split_name_and_number(raw: str):
-    """Version enrichie : nettoie + sépare prénom/nom."""
-    name_part, numero = _clean_name(raw)
-    if not name_part:
-        return "", numero
-    prenom, nom = _split_prenom_nom(name_part)
-    full_name = f"{prenom} {nom}".strip()
-    full_name = re.sub(r'\s+', ' ', full_name)
-    return full_name, numero
+    return ""
 
 
 def parse_roster_structured(html: str):
@@ -575,22 +562,7 @@ def parse_roster_structured(html: str):
     soup = BeautifulSoup(html, "html.parser")
     gardiens, joueurs, personnel = [], [], []
 
-    # --- DEBUG : afficher la structure HTML d'une ligne de chaque table ---
-    tables = soup.find_all("table")
-    for table_idx, table in enumerate(tables):
-        headers = [th.get_text(strip=True) for th in table.select("thead th")]
-        if not headers:
-            continue
-        rows = table.select("tbody tr")
-        if rows:
-            print(f"\n[DEBUG TABLE #{table_idx}] En-têtes: {headers}")
-            html_first_row = str(rows[0])
-            print(f"[DEBUG TABLE #{table_idx}] 1ère ligne HTML (600 chars):")
-            print(html_first_row[:600])
-            print("---")
-
-    # --- Parsing principal ---
-    for table in tables:
+    for table in soup.find_all("table"):
         headers = [th.get_text(strip=True) for th in table.select("thead th")]
         if not headers:
             continue
@@ -602,15 +574,15 @@ def parse_roster_structured(html: str):
                 tds = tr.find_all("td")
                 if len(tds) < 2:
                     continue
-                # Chercher d'abord dans les <a> ou <span> structurés
-                nom_final = _extract_name_from_cell(tds[0])
-                numero = _extract_number_from_cell(tds[0], tds[1])
-                if nom_final:
+                nom = _extract_name_from_cell(tds[0])
+                num = _extract_number_from_cell(tds[0], tds[1])
+                if nom:
                     gardiens.append({
-                        "nom": nom_final,
-                        "numero": numero,
+                        "nom": nom,
+                        "numero": num,
                         "stats": dict(zip(headers, [td.get_text(strip=True) for td in tds]))
                     })
+                    print(f"   → {nom} (#{num})")
 
         elif "joueurs" in hs:
             print(f"\n[ROSTER] Table JOUEURS")
@@ -618,14 +590,15 @@ def parse_roster_structured(html: str):
                 tds = tr.find_all("td")
                 if len(tds) < 2:
                     continue
-                nom_final = _extract_name_from_cell(tds[0])
-                numero = _extract_number_from_cell(tds[0], tds[1])
-                if nom_final:
+                nom = _extract_name_from_cell(tds[0])
+                num = _extract_number_from_cell(tds[0], tds[1])
+                if nom:
                     joueurs.append({
-                        "nom": nom_final,
-                        "numero": numero,
+                        "nom": nom,
+                        "numero": num,
                         "stats": dict(zip(headers, [td.get_text(strip=True) for td in tds]))
                     })
+                    print(f"   → {nom} (#{num})")
 
         elif any("personnel" in h.lower() for h in headers):
             print(f"\n[ROSTER] Table PERSONNEL")
@@ -633,66 +606,19 @@ def parse_roster_structured(html: str):
                 tds = tr.find_all("td")
                 if len(tds) < 2:
                     continue
-                raw_nom = tds[0].get_text(strip=True)
-                # Retirer 1ère lettre parasite
-                if len(raw_nom) >= 2 and raw_nom[0] == raw_nom[1]:
-                    raw_nom = raw_nom[1:]
-                raw_nom = re.sub(r'\s+', ' ', raw_nom).strip()
-                if raw_nom:
-                    personnel.append({
-                        "nom": raw_nom,
-                        "role": tds[1].get_text(strip=True)
-                    })
+                nom = ""
+                sp = tds[0].find("span", class_=re.compile("text-truncate", re.I))
+                if sp:
+                    nom = sp.get_text(strip=True)
+                else:
+                    nom = _extract_name_from_cell(tds[0])
+                role = tds[1].get_text(strip=True)
+                if nom:
+                    personnel.append({"nom": nom, "role": role})
+                    print(f"   → {nom} ({role})")
 
     print(f"\n[PARSING ROSTER] {len(gardiens)} G, {len(joueurs)} J, {len(personnel)} P.")
     return {"gardiens": gardiens, "joueurs": joueurs, "personnel": personnel}
-
-
-def _extract_name_from_cell(td):
-    """
-    Extrait un nom propre depuis une cellule <td>.
-    Essaie plusieurs stratégies :
-    1. Chercher dans un <a> avec un texte > 2 chars
-    2. Chercher dans un <span> avec un texte > 2 chars
-    3. Fallback : texte brut du td (avec nettoyage Spordle)
-    """
-    # Stratégie 1 : chercher dans un <a>
-    a = td.find("a")
-    if a:
-        txt = a.get_text(strip=True)
-        if txt and len(txt) > 2 and not txt.isdigit():
-            return txt
-
-    # Stratégie 2 : chercher dans un <span>
-    for sp in td.find_all("span"):
-        txt = sp.get_text(strip=True)
-        if txt and len(txt) > 2 and not txt.isdigit():
-            return txt
-
-    # Stratégie 3 : fallback avec nettoyage
-    raw = td.get_text(strip=True)
-    cleaned, _ = _clean_name(raw)
-    if cleaned:
-        prenom, nom = _split_prenom_nom(cleaned)
-        return f"{prenom} {nom}".strip()
-    return ""
-
-
-def _extract_number_from_cell(td_name, td_num):
-    """Extrait le numéro depuis la cellule nom ou la cellule suivante."""
-    # Dans le td du nom
-    for sp in td_name.find_all("span"):
-        txt = sp.get_text(strip=True)
-        if txt.isdigit():
-            return txt
-    # Dans le td suivant
-    txt = td_num.get_text(strip=True)
-    if txt.isdigit():
-        return txt
-    # Fallback : extraire du texte brut
-    raw = td_name.get_text(strip=True)
-    m = re.search(r'(\d+)$', raw)
-    return m.group(1) if m else ""
 
 
 def parse_table_generic(html: str, debug_name: str = "generic"):
@@ -721,7 +647,7 @@ def parse_table_generic(html: str, debug_name: str = "generic"):
 
 async def scrape_and_publish():
     print(f"\n{'='*60}")
-    print(f"[START] RseqHockey v3.0.0 - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v3.1.0 - {MY_TEAM_NAME}")
     print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
