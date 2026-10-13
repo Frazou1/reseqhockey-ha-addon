@@ -366,7 +366,6 @@ def _parse_date_header(h4_text: str):
 
 
 def _iso_to_date_fr(iso):
-    """Convertit un ISO UTC en date FR + heure locale (avec fallback DST manuel)."""
     try:
         iso_clean = iso.strip().replace(" ", "")
         dt_utc = datetime.fromisoformat(iso_clean.replace("Z", "+00:00"))
@@ -374,7 +373,6 @@ def _iso_to_date_fr(iso):
         try:
             dt_local = dt_utc.astimezone(ZoneInfo("America/Toronto"))
         except Exception:
-            # Fallback : règle DST Toronto manuelle
             year = dt_utc.year
             march = calendar.monthcalendar(year, 3)
             dst_start_day = [w[6] for w in march if w[6] != 0][1]
@@ -486,8 +484,6 @@ def parse_schedule_cards(html: str):
             }
             matchs.append(match)
             print(f"   {date_fr} {heure_fr} | {arena[:55]} | {equipes} | {score or '-'} | {status}")
-            for e in equipes_details:
-                print(f"      └─ {e['nom']} → logo: {e['logo_local'] or '(échec)'}")
 
     return matchs
 
@@ -496,28 +492,76 @@ def parse_schedule_cards(html: str):
 # PARSING ROSTER
 # ============================================================
 
-def split_name_and_number(raw: str):
+def _clean_name(raw: str):
+    """
+    Nettoie un nom en retirant la 1ère lettre parasite de Spordle.
+    Ex: 'AAANNABELLEMICHAUD35' → ('ANNABELLEMICHAUD', '35')
+        'AALEXIS HOULE' → 'ALEXIS HOULE'
+    """
     raw = raw.strip()
     if not raw:
         return "", ""
 
+    # Retirer numéro
     num_match = re.search(r'(\d+)$', raw)
     numero = num_match.group(1) if num_match else ""
     name_part = raw[:num_match.start()] if num_match else raw
 
-    # Retirer la 1ère lettre si elle est dupliquée (parasite Spordle)
+    # Retirer UNE seule lettre parasite (le 1er caractère si dupliqué au 2e)
     if len(name_part) >= 2 and name_part[0] == name_part[1]:
         name_part = name_part[1:]
 
-    parts = re.split(r'(?<=[a-zéèêëàâäîïôöùûüç])(?=[A-ZÉÈÊËÀÂÄÎÏÔÖÙÛÜÇ])', name_part)
-    if len(parts) >= 2:
-        prenom = parts[0]
-        nom = " ".join(parts[1:])
-        full_name = f"{prenom} {nom}"
-    else:
-        full_name = name_part
+    return name_part.strip(), numero
 
-    full_name = re.sub(r'\s+', ' ', full_name).strip()
+
+def _split_prenom_nom(name_upper: str):
+    """
+    Sépare 'ANNABELLEMICHAUD' en 'ANNABELLE MICHAUD'.
+    Utilise une liste de prénoms québécois courants + heuristiques.
+    """
+    # Premiers indices : séparer sur tiret (ex: LOUIS-PHILIPPEDROUIN)
+    if '-' in name_upper:
+        idx = name_upper.index('-')
+        # Trouver la fin du prénom composé (après le prochain segment en majuscules)
+        # Ex: LOUIS-PHILIPPEDROUIN → LOUIS-PHILIPPE + DROUIN
+        m = re.match(r'^([A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ]+-[A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ]+)([A-ZÀÂÄÉÈÊËÎÏÔÖÙÛÜÇ].*)$', name_upper)
+        if m:
+            return m.group(1), m.group(2)
+
+    # Liste de prénoms fréquents (extensible)
+    PRENOMS = [
+        "ANNABELLE", "ADAM", "ANTOINE", "ELLIOT", "JACOB", "JAKOB",
+        "JOUEUR2", "LOUIS-PHILIPPE", "LOUIS", "LYAM", "MILAN", "OLIVIER",
+        "THOMAS", "VICTOR", "ALEXIS", "BRYAN", "FELIX", "GABRIEL",
+        "JÉRÉMY", "MATHIAS", "PASCAL", "RENAUD", "ROMAIN", "SYLVAIN",
+        "SAMUEL", "LUCAS", "NATHAN", "WILLIAM", "EMMANUEL", "RAPHAEL",
+        "ANTHONY", "CHARLES", "DAVID", "ÉRIC", "FRÉDÉRIC", "HUGO",
+        "ISAAC", "JULIEN", "KEVIN", "LÉO", "MARC", "NICOLAS", "PIERRE",
+        "SIMON", "VINCENT", "XAVIER", "ZACHARY",
+    ]
+
+    for prenom in sorted(PRENOMS, key=len, reverse=True):
+        if name_upper.startswith(prenom) and len(name_upper) > len(prenom):
+            return prenom, name_upper[len(prenom):]
+
+    # Heuristique : prénoms québécois = souvent 4-8 lettres
+    # On coupe après 4-8 lettres selon une recherche de frontière plausible
+    for split_at in range(8, 3, -1):
+        if len(name_upper) > split_at:
+            return name_upper[:split_at], name_upper[split_at:]
+
+    # Fallback : tout en un seul mot
+    return name_upper, ""
+
+
+def split_name_and_number(raw: str):
+    """Version enrichie : nettoie + sépare prénom/nom."""
+    name_part, numero = _clean_name(raw)
+    if not name_part:
+        return "", numero
+    prenom, nom = _split_prenom_nom(name_part)
+    full_name = f"{prenom} {nom}".strip()
+    full_name = re.sub(r'\s+', ' ', full_name)
     return full_name, numero
 
 
@@ -530,42 +574,125 @@ def parse_roster_structured(html: str):
 
     soup = BeautifulSoup(html, "html.parser")
     gardiens, joueurs, personnel = [], [], []
-    for table in soup.find_all("table"):
+
+    # --- DEBUG : afficher la structure HTML d'une ligne de chaque table ---
+    tables = soup.find_all("table")
+    for table_idx, table in enumerate(tables):
+        headers = [th.get_text(strip=True) for th in table.select("thead th")]
+        if not headers:
+            continue
+        rows = table.select("tbody tr")
+        if rows:
+            print(f"\n[DEBUG TABLE #{table_idx}] En-têtes: {headers}")
+            html_first_row = str(rows[0])
+            print(f"[DEBUG TABLE #{table_idx}] 1ère ligne HTML (600 chars):")
+            print(html_first_row[:600])
+            print("---")
+
+    # --- Parsing principal ---
+    for table in tables:
         headers = [th.get_text(strip=True) for th in table.select("thead th")]
         if not headers:
             continue
         hs = set(h.lower() for h in headers)
-        if "gardiens" in hs:
-            for tr in table.select("tbody tr"):
-                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if len(tds) < 2:
-                    continue
-                nom, num = split_name_and_number(tds[0])
-                if nom:
-                    gardiens.append({"nom": nom, "numero": num, "stats": dict(zip(headers, tds))})
-        elif "joueurs" in hs:
-            for tr in table.select("tbody tr"):
-                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if len(tds) < 2:
-                    continue
-                nom, num = split_name_and_number(tds[0])
-                if nom:
-                    joueurs.append({"nom": nom, "numero": num, "stats": dict(zip(headers, tds))})
-        elif any("personnel" in h.lower() for h in headers):
-            for tr in table.select("tbody tr"):
-                tds = [td.get_text(strip=True) for td in tr.find_all("td")]
-                if len(tds) < 2:
-                    continue
-                nom = tds[0].strip()
-                # Retirer la 1ère lettre si dupliquée
-                if len(nom) >= 2 and nom[0] == nom[1]:
-                    nom = nom[1:]
-                nom = re.sub(r'\s+', ' ', nom).strip()
-                if nom:
-                    personnel.append({"nom": nom, "role": tds[1]})
 
-    print(f"[PARSING ROSTER] {len(gardiens)} G, {len(joueurs)} J, {len(personnel)} P.")
+        if "gardiens" in hs:
+            print(f"\n[ROSTER] Table GARDIENS")
+            for tr in table.select("tbody tr"):
+                tds = tr.find_all("td")
+                if len(tds) < 2:
+                    continue
+                # Chercher d'abord dans les <a> ou <span> structurés
+                nom_final = _extract_name_from_cell(tds[0])
+                numero = _extract_number_from_cell(tds[0], tds[1])
+                if nom_final:
+                    gardiens.append({
+                        "nom": nom_final,
+                        "numero": numero,
+                        "stats": dict(zip(headers, [td.get_text(strip=True) for td in tds]))
+                    })
+
+        elif "joueurs" in hs:
+            print(f"\n[ROSTER] Table JOUEURS")
+            for tr in table.select("tbody tr"):
+                tds = tr.find_all("td")
+                if len(tds) < 2:
+                    continue
+                nom_final = _extract_name_from_cell(tds[0])
+                numero = _extract_number_from_cell(tds[0], tds[1])
+                if nom_final:
+                    joueurs.append({
+                        "nom": nom_final,
+                        "numero": numero,
+                        "stats": dict(zip(headers, [td.get_text(strip=True) for td in tds]))
+                    })
+
+        elif any("personnel" in h.lower() for h in headers):
+            print(f"\n[ROSTER] Table PERSONNEL")
+            for tr in table.select("tbody tr"):
+                tds = tr.find_all("td")
+                if len(tds) < 2:
+                    continue
+                raw_nom = tds[0].get_text(strip=True)
+                # Retirer 1ère lettre parasite
+                if len(raw_nom) >= 2 and raw_nom[0] == raw_nom[1]:
+                    raw_nom = raw_nom[1:]
+                raw_nom = re.sub(r'\s+', ' ', raw_nom).strip()
+                if raw_nom:
+                    personnel.append({
+                        "nom": raw_nom,
+                        "role": tds[1].get_text(strip=True)
+                    })
+
+    print(f"\n[PARSING ROSTER] {len(gardiens)} G, {len(joueurs)} J, {len(personnel)} P.")
     return {"gardiens": gardiens, "joueurs": joueurs, "personnel": personnel}
+
+
+def _extract_name_from_cell(td):
+    """
+    Extrait un nom propre depuis une cellule <td>.
+    Essaie plusieurs stratégies :
+    1. Chercher dans un <a> avec un texte > 2 chars
+    2. Chercher dans un <span> avec un texte > 2 chars
+    3. Fallback : texte brut du td (avec nettoyage Spordle)
+    """
+    # Stratégie 1 : chercher dans un <a>
+    a = td.find("a")
+    if a:
+        txt = a.get_text(strip=True)
+        if txt and len(txt) > 2 and not txt.isdigit():
+            return txt
+
+    # Stratégie 2 : chercher dans un <span>
+    for sp in td.find_all("span"):
+        txt = sp.get_text(strip=True)
+        if txt and len(txt) > 2 and not txt.isdigit():
+            return txt
+
+    # Stratégie 3 : fallback avec nettoyage
+    raw = td.get_text(strip=True)
+    cleaned, _ = _clean_name(raw)
+    if cleaned:
+        prenom, nom = _split_prenom_nom(cleaned)
+        return f"{prenom} {nom}".strip()
+    return ""
+
+
+def _extract_number_from_cell(td_name, td_num):
+    """Extrait le numéro depuis la cellule nom ou la cellule suivante."""
+    # Dans le td du nom
+    for sp in td_name.find_all("span"):
+        txt = sp.get_text(strip=True)
+        if txt.isdigit():
+            return txt
+    # Dans le td suivant
+    txt = td_num.get_text(strip=True)
+    if txt.isdigit():
+        return txt
+    # Fallback : extraire du texte brut
+    raw = td_name.get_text(strip=True)
+    m = re.search(r'(\d+)$', raw)
+    return m.group(1) if m else ""
 
 
 def parse_table_generic(html: str, debug_name: str = "generic"):
@@ -594,7 +721,7 @@ def parse_table_generic(html: str, debug_name: str = "generic"):
 
 async def scrape_and_publish():
     print(f"\n{'='*60}")
-    print(f"[START] RseqHockey v2.9.1 - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v3.0.0 - {MY_TEAM_NAME}")
     print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -625,103 +752,4 @@ async def scrape_and_publish():
     player_stats_sr = parse_table_generic(stats_html, "stats_saison_reguliere") if stats_html else []
 
     joues = [m for m in matchs if m["joue"]]
-    a_venir = [m for m in matchs if not m["joue"]]
-    joues.sort(key=lambda m: m.get("date_iso", ""))
-    a_venir.sort(key=lambda m: m.get("date_iso", ""))
-
-    last_match = joues[-1] if joues else None
-    next_match = a_venir[0] if a_venir else None
-
-    print(f"\n[STATS] {len(joues)} joué(s), {len(a_venir)} à venir.")
-    if last_match:
-        print(f"   Dernier: {last_match['date']} {last_match['equipes']} {last_match['score']}")
-    if next_match:
-        print(f"   Prochain: {next_match['date']} {next_match['heure']} @ {next_match['arene']}")
-
-    player_info_sr = next(
-        (p for p in player_stats_sr if TRACKED_PLAYER in p.get("Nom", "").lower()),
-        None
-    ) if TRACKED_PLAYER else None
-
-    print("\n[MQTT] Publication...")
-
-    def build_config(name, oid, st, at, icon):
-        return {"name": name, "object_id": oid, "unique_id": oid,
-                "state_topic": st, "json_attributes_topic": at,
-                "icon": icon, "device": DEVICE_INFO}
-
-    def publish_config(topic, cfg):
-        print(f"\n[MQTT DISCOVERY] {topic}")
-        publish_to_mqtt(topic, cfg)
-
-    total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
-    publish_config(
-        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config",
-        build_config(f"RSEQ Alignement", f"rseqhockey_{TEAM_ID}_roster",
-                     f"rseqhockey/{TEAM_ID}/roster/state",
-                     f"rseqhockey/{TEAM_ID}/roster/attributes", "mdi:account-group"))
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/state",
-                    f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
-
-    if next_match:
-        state = f"{next_match['date']} {next_match['heure']} - {next_match['arene']}"
-    else:
-        state = "Aucun match prévu"
-    publish_config(
-        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config",
-        build_config(f"RSEQ Prochain match", f"rseqhockey_{TEAM_ID}_schedule",
-                     f"rseqhockey/{TEAM_ID}/schedule/state",
-                     f"rseqhockey/{TEAM_ID}/schedule/attributes", "mdi:calendar-clock"))
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", state)
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", {
-        "prochain_match": next_match,
-        "matchs_a_venir": a_venir,
-        "nb_total": len(matchs),
-    })
-
-    if last_match:
-        if len(last_match["equipes"]) >= 2:
-            last_state = f"{last_match['date']} : {' '.join(last_match['equipes'])} {last_match['score']}"
-        else:
-            last_state = f"{last_match['date']} | {last_match['score']}"
-    else:
-        last_state = "Aucun match joué"
-    publish_config(
-        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_last_match/config",
-        build_config(f"RSEQ Dernier match", f"rseqhockey_{TEAM_ID}_last_match",
-                     f"rseqhockey/{TEAM_ID}/last_match/state",
-                     f"rseqhockey/{TEAM_ID}/last_match/attributes", "mdi:scoreboard"))
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/last_match/state", last_state)
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/last_match/attributes", {
-        "match": last_match,
-        "tous_les_matchs_joues": joues,
-    })
-
-    if TRACKED_PLAYER:
-        ps = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
-        pts = player_info_sr.get("PTS", "0") if player_info_sr else "0"
-        publish_config(
-            f"homeassistant/sensor/rseqhockey_player_{ps}/config",
-            build_config(f"RSEQ Joueur {TRACKED_PLAYER.capitalize()}", f"rseqhockey_player_{ps}",
-                         f"rseqhockey/player/{ps}/state",
-                         f"rseqhockey/player/{ps}/attributes", "mdi:account-star"))
-        publish_to_mqtt(f"rseqhockey/player/{ps}/state", f"SR: {pts} pts")
-        publish_to_mqtt(f"rseqhockey/player/{ps}/attributes", {"stats_saison_reguliere": player_info_sr})
-
-    publish_config(
-        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config",
-        build_config(f"RSEQ Stats Saison", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere",
-                     f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state",
-                     f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks"))
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"{len(player_stats_sr)} joueurs")
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", {"joueurs": player_stats_sr})
-
-    print("\n[FIN] Cycle terminé.")
-
-
-if __name__ == "__main__":
-    while True:
-        asyncio.run(scrape_and_publish())
-        print(f"\n[ATTENTE] {INTERVAL / 3600}h...")
-        time.sleep(INTERVAL)
+    a_venir = [m for m in matchs if not m["j
