@@ -4,7 +4,8 @@ import re
 import os
 import asyncio
 import urllib.request
-from datetime import datetime
+import calendar
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import aiohttp
 from bs4 import BeautifulSoup
@@ -117,10 +118,8 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
             viewport={"width": 1280, "height": 900},
             user_agent=ua,
             locale="fr-CA",
-            timezone_id="America/Toronto",
         )
 
-        # --- Injection des cookies Cloudflare ---
         if cookies:
             pw_cookies = []
             for c in cookies:
@@ -157,7 +156,6 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
             await browser.close()
             return None
 
-        # Attente Cloudflare
         for i in range(30):
             title = (await page.title()).lower()
             if "un instant" not in title and "just a moment" not in title:
@@ -173,7 +171,6 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
 
         await page.wait_for_timeout(3000)
 
-        # Attente fin skeletons
         print("[PLAYWRIGHT] Attente fin du chargement (skeletons)...")
         for i in range(20):
             sk = await page.locator(".spdl-skeleton").count()
@@ -182,7 +179,6 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
                 break
             await page.wait_for_timeout(1000)
 
-        # --- Clic 1 : dropdown ---
         print("\n[PLAYWRIGHT] Clic 1/3 : ouvrir le dropdown de filtre")
         try:
             btn = page.locator(
@@ -196,13 +192,7 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
             await page.wait_for_timeout(1500)
         except Exception as e:
             print(f"[PLAYWRIGHT] ✗ Échec clic 1 : {e}")
-            try:
-                with open("/share/schedule_debug_fail.html", "w", encoding="utf-8") as f:
-                    f.write(await page.content())
-            except Exception:
-                pass
 
-        # --- Clic 2 : Saison 2026-27 ---
         print("\n[PLAYWRIGHT] Clic 2/3 : 'Saison 2026-27'")
         try:
             li = page.locator("li:has-text('Saison')").first
@@ -213,7 +203,6 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
         except Exception as e:
             print(f"[PLAYWRIGHT] ✗ Échec clic 2 : {e}")
 
-        # --- Clic 3 : Appliquer ---
         print("\n[PLAYWRIGHT] Clic 3/3 : 'Appliquer'")
         try:
             btn = page.locator("button:has-text('Appliquer')").first
@@ -223,7 +212,6 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
         except Exception as e:
             print(f"[PLAYWRIGHT] ✗ Échec clic 3 : {e}")
 
-        # --- Attente chargement matchs ---
         print("\n[PLAYWRIGHT] Attente chargement des matchs...")
         for i in range(30):
             sk = await page.locator(".spdl-skeleton").count()
@@ -242,7 +230,6 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
         try:
             with open("/share/schedule_debug.html", "w", encoding="utf-8") as f:
                 f.write(html)
-            print("[PLAYWRIGHT] HTML sauvegardé dans /share/schedule_debug.html")
         except Exception:
             pass
 
@@ -301,8 +288,6 @@ def publish_to_mqtt(topic, payload):
 # ============================================================
 
 def _slugify(name: str) -> str:
-    """Convertit un nom d'équipe en slug ASCII sûr pour nom de fichier."""
-    # Remplacement des accents courants
     replacements = {
         'à': 'a', 'â': 'a', 'ä': 'a', 'á': 'a', 'ã': 'a', 'å': 'a',
         'ç': 'c', 'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e',
@@ -319,7 +304,6 @@ def _slugify(name: str) -> str:
 
 
 def download_logo(url: str, team_name: str) -> str:
-    """Télécharge un logo dans /share/rseqhockey_logos/ et retourne le chemin HTTP local."""
     if not url:
         return ""
     try:
@@ -370,7 +354,6 @@ _MOIS_ABBR = {
 
 
 def _parse_date_header(h4_text: str):
-    """Convertit 'vendredi 2 octobre 2026' en ('VEN. 2 OCT.', '2026-10-02')."""
     m = re.match(r'(\w+)\s+(\d{1,2})\s+(\w+)\s+(\d{4})', h4_text.strip(), re.I)
     if not m:
         return h4_text, ""
@@ -383,11 +366,27 @@ def _parse_date_header(h4_text: str):
 
 
 def _iso_to_date_fr(iso):
-    """Convertit un ISO UTC en date FR + heure locale."""
+    """Convertit un ISO UTC en date FR + heure locale (avec fallback DST manuel)."""
     try:
         iso_clean = iso.strip().replace(" ", "")
-        dt = datetime.fromisoformat(iso_clean.replace("Z", "+00:00")).astimezone(ZoneInfo("America/Toronto"))
-        return f"{_JOURS_FR[dt.weekday()]}. {dt.day} {_MOIS_FR[dt.month-1]}.", dt.strftime("%Hh%M")
+        dt_utc = datetime.fromisoformat(iso_clean.replace("Z", "+00:00"))
+
+        try:
+            dt_local = dt_utc.astimezone(ZoneInfo("America/Toronto"))
+        except Exception:
+            # Fallback : règle DST Toronto manuelle
+            year = dt_utc.year
+            march = calendar.monthcalendar(year, 3)
+            dst_start_day = [w[6] for w in march if w[6] != 0][1]
+            dst_start = datetime(year, 3, dst_start_day, 7, 0)
+            nov = calendar.monthcalendar(year, 11)
+            dst_end_day = [w[6] for w in nov if w[6] != 0][0]
+            dst_end = datetime(year, 11, dst_end_day, 6, 0)
+            dt_naive = dt_utc.replace(tzinfo=None)
+            offset_h = -4 if dst_start <= dt_naive < dst_end else -5
+            dt_local = dt_utc + timedelta(hours=offset_h)
+
+        return f"{_JOURS_FR[dt_local.weekday()]}. {dt_local.day} {_MOIS_FR[dt_local.month-1]}.", dt_local.strftime("%Hh%M")
     except Exception as e:
         print(f"[TZ WARN] {iso}: {e}")
         return "", ""
@@ -407,13 +406,11 @@ def parse_schedule_cards(html: str):
 
         articles = section_li.find_all("article", attrs={"itemtype": re.compile("SportsEvent", re.I)})
         for art in articles:
-            # Aréna
             arena = ""
             addr = art.find("address")
             if addr:
                 arena = addr.get_text(" ", strip=True)
 
-            # Numéro
             num_match = ""
             sched_type = art.find("span", class_=re.compile("scheduleType", re.I))
             if sched_type:
@@ -422,7 +419,6 @@ def parse_schedule_cards(html: str):
                 if m:
                     num_match = m.group(0)
 
-            # Date/heure
             iso = ""
             date_fr = section_date_fr
             heure_fr = ""
@@ -435,7 +431,6 @@ def parse_schedule_cards(html: str):
                         date_fr = d_fr
                         heure_fr = h_fr
 
-            # Score + statut
             score = ""
             status = "À VENIR"
             final_el = art.find(string=re.compile(
@@ -447,7 +442,6 @@ def parse_schedule_cards(html: str):
                 if len(digits) >= 2:
                     score = f"{digits[0]}-{digits[1]}"
 
-            # Équipes + logos
             equipes = []
             equipes_details = []
             teams = art.find_all("article", attrs={"itemtype": re.compile("SportsTeam", re.I)})
@@ -588,7 +582,7 @@ def parse_table_generic(html: str, debug_name: str = "generic"):
 
 async def scrape_and_publish():
     print(f"\n{'='*60}")
-    print(f"[START] RseqHockey v2.9.0 - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v2.9.1 - {MY_TEAM_NAME}")
     print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -597,18 +591,15 @@ async def scrape_and_publish():
     timeout = aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT + 30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
 
-        # --- 1. FlareSolverr : cookies ---
         cookies, user_agent = await get_cloudflare_cookies(session)
         if not cookies:
             print("[ABORT] Impossible d'obtenir les cookies Cloudflare.")
             return
 
-        # --- 2. Playwright : schedule ---
         schedule_html = await fetch_schedule_with_playwright(
             f"{team_url}?tab=schedule", cookies, user_agent
         )
 
-        # --- 3. FlareSolverr : roster + stats ---
         roster_html = await fetch_with_flaresolverr(session, f"{team_url}?tab=roster", "roster")
         stats_html = await fetch_with_flaresolverr(
             session,
@@ -651,7 +642,6 @@ async def scrape_and_publish():
         print(f"\n[MQTT DISCOVERY] {topic}")
         publish_to_mqtt(topic, cfg)
 
-    # Roster
     total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config",
@@ -662,7 +652,6 @@ async def scrape_and_publish():
                     f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
-    # Prochain match
     if next_match:
         state = f"{next_match['date']} {next_match['heure']} - {next_match['arene']}"
     else:
@@ -679,7 +668,6 @@ async def scrape_and_publish():
         "nb_total": len(matchs),
     })
 
-    # Dernier match
     if last_match:
         if len(last_match["equipes"]) >= 2:
             last_state = f"{last_match['date']} : {' '.join(last_match['equipes'])} {last_match['score']}"
@@ -698,7 +686,6 @@ async def scrape_and_publish():
         "tous_les_matchs_joues": joues,
     })
 
-    # Joueur suivi
     if TRACKED_PLAYER:
         ps = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
         pts = player_info_sr.get("PTS", "0") if player_info_sr else "0"
@@ -710,7 +697,6 @@ async def scrape_and_publish():
         publish_to_mqtt(f"rseqhockey/player/{ps}/state", f"SR: {pts} pts")
         publish_to_mqtt(f"rseqhockey/player/{ps}/attributes", {"stats_saison_reguliere": player_info_sr})
 
-    # Stats saison
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config",
         build_config(f"RSEQ Stats Saison", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere",
