@@ -503,58 +503,54 @@ def parse_schedule_cards(html: str):
 # ============================================================
 
 def _extract_name_from_cell(td):
+    """
+    Extrait le nom depuis le <div title="NOM"> de Spordle.
+    Le title contient 'PRÉNOM NOM' propre.
+    """
+    # Priorité 1 : attribut title d'un div
     for div in td.find_all("div"):
         title = div.get("title", "").strip()
         if title and len(title) > 2 and not title.isdigit():
             return title
-    for sp in td.find_all("span"):
-        title = sp.get("title", "").strip()
-        if title and len(title) > 2 and not title.isdigit():
-            return title
+
+    # Priorité 2 : balise <a> avec texte direct
     a = td.find("a")
     if a:
         txt = a.get_text(strip=True)
         if txt and len(txt) > 2 and not txt.isdigit():
             return txt
+
+    # Priorité 3 : span avec class text-truncate (personnel)
     sp = td.find("span", class_=re.compile("text-truncate", re.I))
     if sp:
         txt = sp.get_text(strip=True)
         if txt and len(txt) > 2:
             return txt
+
     return ""
 
 
 def _extract_number_from_cell(td_name, td_num):
     """
-    Extrait le numéro de maillot. Cherche dans :
-    1. Un span avec class contenant 'jersey'/'number'/'num'
-    2. Le title du div ("ANNABELLE MICHAUD 35")
-    3. Toutes les <td> du <tr> avec un ID contenant 'number'/'jersey'
+    Extrait le numéro. Il est dans :
+    <span class='ml-2 text-muted'><span>11</span></span>
     """
-    # Stratégie 1 : classe jersey/number
+    # Priorité 1 : span avec class ml-2 text-muted
     for sp in td_name.find_all("span"):
-        classes = " ".join(sp.get("class", [])).lower()
-        if "jersey" in classes or "number" in classes:
-            txt = sp.get_text(strip=True)
-            if txt.isdigit():
-                return txt
-
-    # Stratégie 2 : title du div avec numéro à la fin
-    for div in td_name.find_all("div"):
-        title = div.get("title", "")
-        m = re.search(r'\s(\d{1,2})$', title)
-        if m:
-            return m.group(1)
-
-    # Stratégie 3 : chercher dans le <tr> une cellule dont l'ID contient 'number'/'jersey'
-    tr = td_name.find_parent("tr")
-    if tr:
-        for td in tr.find_all("td"):
-            td_id = (td.get("id") or "").lower()
-            if "number" in td_id or "jersey" in td_id:
-                txt = td.get_text(strip=True)
+        classes = " ".join(sp.get("class", []))
+        if "text-muted" in classes and "ml-2" in classes:
+            num_span = sp.find("span")
+            if num_span:
+                txt = num_span.get_text(strip=True)
                 if txt.isdigit():
                     return txt
+
+    # Priorité 2 : chercher le dernier <span> du td qui ne contient qu'un nombre 1-2 chiffres
+    all_spans = td_name.find_all("span")
+    for sp in reversed(all_spans):
+        txt = sp.get_text(strip=True)
+        if txt.isdigit() and 1 <= int(txt) <= 99:
+            return txt
 
     return ""
 
@@ -618,7 +614,9 @@ def parse_roster_structured(html: str):
                 if sp:
                     nom = sp.get_text(strip=True)
                 else:
-                    nom = _extract_name_from_cell(tds[0])
+                    div = tds[0].find("div", attrs={"title": True})
+                    if div:
+                        nom = div.get("title", "").strip()
                 role = tds[1].get_text(strip=True)
                 if nom:
                     personnel.append({"nom": nom, "role": role})
@@ -654,7 +652,7 @@ def parse_table_generic(html: str, debug_name: str = "generic"):
 
 async def scrape_and_publish():
     print(f"\n{'='*60}")
-    print(f"[START] RseqHockey v3.2.0 - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v3.3.0 - {MY_TEAM_NAME}")
     print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
