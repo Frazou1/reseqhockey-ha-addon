@@ -500,16 +500,25 @@ def split_name_and_number(raw: str):
     raw = raw.strip()
     if not raw:
         return "", ""
+
     num_match = re.search(r'(\d+)$', raw)
     numero = num_match.group(1) if num_match else ""
     name_part = raw[:num_match.start()] if num_match else raw
-    name_part = re.sub(r'^(.)\1+', r'\1', name_part, count=1)
+
+    # Retirer la 1ère lettre si elle est dupliquée (parasite Spordle)
+    if len(name_part) >= 2 and name_part[0] == name_part[1]:
+        name_part = name_part[1:]
+
     parts = re.split(r'(?<=[a-zéèêëàâäîïôöùûüç])(?=[A-ZÉÈÊËÀÂÄÎÏÔÖÙÛÜÇ])', name_part)
     if len(parts) >= 2:
-        full_name = f"{parts[0]} {' '.join(parts[1:])}"
+        prenom = parts[0]
+        nom = " ".join(parts[1:])
+        full_name = f"{prenom} {nom}"
     else:
         full_name = name_part
-    return re.sub(r'\s+', ' ', full_name).strip(), numero
+
+    full_name = re.sub(r'\s+', ' ', full_name).strip()
+    return full_name, numero
 
 
 def parse_roster_structured(html: str):
@@ -547,7 +556,10 @@ def parse_roster_structured(html: str):
                 tds = [td.get_text(strip=True) for td in tr.find_all("td")]
                 if len(tds) < 2:
                     continue
-                nom = re.sub(r'^(.)\1+', r'\1', tds[0].strip(), count=1)
+                nom = tds[0].strip()
+                # Retirer la 1ère lettre si dupliquée
+                if len(nom) >= 2 and nom[0] == nom[1]:
+                    nom = nom[1:]
                 nom = re.sub(r'\s+', ' ', nom).strip()
                 if nom:
                     personnel.append({"nom": nom, "role": tds[1]})
