@@ -752,4 +752,103 @@ async def scrape_and_publish():
     player_stats_sr = parse_table_generic(stats_html, "stats_saison_reguliere") if stats_html else []
 
     joues = [m for m in matchs if m["joue"]]
-    a_venir = [m for m in matchs if not m["j
+    a_venir = [m for m in matchs if not m["joue"]]
+    joues.sort(key=lambda m: m.get("date_iso", ""))
+    a_venir.sort(key=lambda m: m.get("date_iso", ""))
+
+    last_match = joues[-1] if joues else None
+    next_match = a_venir[0] if a_venir else None
+
+    print(f"\n[STATS] {len(joues)} joué(s), {len(a_venir)} à venir.")
+    if last_match:
+        print(f"   Dernier: {last_match['date']} {last_match['equipes']} {last_match['score']}")
+    if next_match:
+        print(f"   Prochain: {next_match['date']} {next_match['heure']} @ {next_match['arene']}")
+
+    player_info_sr = next(
+        (p for p in player_stats_sr if TRACKED_PLAYER in p.get("Nom", "").lower()),
+        None
+    ) if TRACKED_PLAYER else None
+
+    print("\n[MQTT] Publication...")
+
+    def build_config(name, oid, st, at, icon):
+        return {"name": name, "object_id": oid, "unique_id": oid,
+                "state_topic": st, "json_attributes_topic": at,
+                "icon": icon, "device": DEVICE_INFO}
+
+    def publish_config(topic, cfg):
+        print(f"\n[MQTT DISCOVERY] {topic}")
+        publish_to_mqtt(topic, cfg)
+
+    total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
+    publish_config(
+        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config",
+        build_config(f"RSEQ Alignement", f"rseqhockey_{TEAM_ID}_roster",
+                     f"rseqhockey/{TEAM_ID}/roster/state",
+                     f"rseqhockey/{TEAM_ID}/roster/attributes", "mdi:account-group"))
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/state",
+                    f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
+
+    if next_match:
+        state = f"{next_match['date']} {next_match['heure']} - {next_match['arene']}"
+    else:
+        state = "Aucun match prévu"
+    publish_config(
+        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config",
+        build_config(f"RSEQ Prochain match", f"rseqhockey_{TEAM_ID}_schedule",
+                     f"rseqhockey/{TEAM_ID}/schedule/state",
+                     f"rseqhockey/{TEAM_ID}/schedule/attributes", "mdi:calendar-clock"))
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/state", state)
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", {
+        "prochain_match": next_match,
+        "matchs_a_venir": a_venir,
+        "nb_total": len(matchs),
+    })
+
+    if last_match:
+        if len(last_match["equipes"]) >= 2:
+            last_state = f"{last_match['date']} : {' '.join(last_match['equipes'])} {last_match['score']}"
+        else:
+            last_state = f"{last_match['date']} | {last_match['score']}"
+    else:
+        last_state = "Aucun match joué"
+    publish_config(
+        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_last_match/config",
+        build_config(f"RSEQ Dernier match", f"rseqhockey_{TEAM_ID}_last_match",
+                     f"rseqhockey/{TEAM_ID}/last_match/state",
+                     f"rseqhockey/{TEAM_ID}/last_match/attributes", "mdi:scoreboard"))
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/last_match/state", last_state)
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/last_match/attributes", {
+        "match": last_match,
+        "tous_les_matchs_joues": joues,
+    })
+
+    if TRACKED_PLAYER:
+        ps = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
+        pts = player_info_sr.get("PTS", "0") if player_info_sr else "0"
+        publish_config(
+            f"homeassistant/sensor/rseqhockey_player_{ps}/config",
+            build_config(f"RSEQ Joueur {TRACKED_PLAYER.capitalize()}", f"rseqhockey_player_{ps}",
+                         f"rseqhockey/player/{ps}/state",
+                         f"rseqhockey/player/{ps}/attributes", "mdi:account-star"))
+        publish_to_mqtt(f"rseqhockey/player/{ps}/state", f"SR: {pts} pts")
+        publish_to_mqtt(f"rseqhockey/player/{ps}/attributes", {"stats_saison_reguliere": player_info_sr})
+
+    publish_config(
+        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config",
+        build_config(f"RSEQ Stats Saison", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere",
+                     f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state",
+                     f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks"))
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"{len(player_stats_sr)} joueurs")
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", {"joueurs": player_stats_sr})
+
+    print("\n[FIN] Cycle terminé.")
+
+
+if __name__ == "__main__":
+    while True:
+        asyncio.run(scrape_and_publish())
+        print(f"\n[ATTENTE] {INTERVAL / 3600}h...")
+        time.sleep(INTERVAL)
