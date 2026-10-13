@@ -28,6 +28,7 @@ FLARESOLVERR_TIMEOUT = config.get("flaresolverr_timeout", 90)
 
 LEAGUE_UUID = "ae5bed83-a302-4ac5-927b-639d2c20a3c9"
 SCHEDULE_SAISON_REGULIERE = "198862"
+BASE_WEB = "https://scolaire.rseqhockey.com/fr"
 
 LOGOS_DIR = "/share/rseqhockey_logos"
 WWW_LOGOS_DIR = "/config/www/rseqhockey_logos"
@@ -47,108 +48,221 @@ DEVICE_INFO = {
 }
 
 
-# ---------- PLAYWRIGHT : clics automatisés sur l'horaire ----------
+# ============================================================
+# ÉTAPE 1 : FlareSolverr récupère les cookies Cloudflare
+# ============================================================
 
-async def fetch_schedule_with_clicks(team_url):
+async def get_cloudflare_cookies(session):
+    """Demande à FlareSolverr de visiter le site et retourne les cookies."""
+    print("\n" + "="*60)
+    print("[ÉTAPE 1] FlareSolverr : obtention des cookies Cloudflare")
+    print("="*60)
+    payload = {
+        "cmd": "request.get",
+        "url": f"{BASE_WEB}/teams/{TEAM_ID}?tab=schedule",
+        "maxTimeout": FLARESOLVERR_TIMEOUT * 1000,
+    }
+    try:
+        async with session.post(FLARESOLVERR_URL, json=payload) as resp:
+            data = await resp.json()
+    except Exception as e:
+        print(f"[FLARESOLVERR ERROR] {e}")
+        return None, None
+
+    status = data.get("status")
+    if status != "ok":
+        print(f"[FLARESOLVERR ERROR] status={status} | {data.get('message')}")
+        return None, None
+
+    solution = data.get("solution", {})
+    cookies = solution.get("cookies", [])
+    html = solution.get("response", "")
+    user_agent = solution.get("userAgent", "")
+
+    print(f"[FLARESOLVERR OK] {len(cookies)} cookie(s) récupéré(s), HTML: {len(html)} octets")
+    for c in cookies:
+        print(f"   → {c.get('name')} (domain={c.get('domain')})")
+    if user_agent:
+        print(f"   User-Agent: {user_agent[:80]}...")
+
+    return cookies, user_agent
+
+
+# ============================================================
+# ÉTAPE 2 : Playwright avec cookies pré-injectés
+# ============================================================
+
+async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
     """
-    Ouvre la page horaire, clique sur 'Saison 2026-27' puis 'Appliquer',
-    et retourne le HTML une fois la liste des matchs chargée.
+    Lance Playwright avec les cookies Cloudflare déjà valides,
+    clique sur 'Saison 2026-27' + 'Appliquer', et récupère le HTML final.
     """
-    print(f"\n[PLAYWRIGHT] Démarrage du navigateur pour l'horaire...")
+    print("\n" + "="*60)
+    print("[ÉTAPE 2] Playwright : navigation + clics")
+    print("="*60)
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage",
-                  "--disable-blink-features=AutomationControlled"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+            ],
         )
+
+        ua = user_agent or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+
         context = await browser.new_context(
             viewport={"width": 1280, "height": 900},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            user_agent=ua,
             locale="fr-CA",
+            timezone_id="America/Toronto",
         )
+
+        # --- Injection des cookies Cloudflare ---
+        if cookies:
+            pw_cookies = []
+            for c in cookies:
+                cookie = {
+                    "name": c.get("name"),
+                    "value": c.get("value"),
+                    "domain": c.get("domain"),
+                    "path": c.get("path", "/"),
+                }
+                if c.get("expires") and c.get("expires") > 0:
+                    cookie["expires"] = c["expires"]
+                if c.get("secure") is not None:
+                    cookie["secure"] = c["secure"]
+                if c.get("httpOnly") is not None:
+                    cookie["httpOnly"] = c["httpOnly"]
+                pw_cookies.append(cookie)
+            await context.add_cookies(pw_cookies)
+            print(f"[PLAYWRIGHT] {len(pw_cookies)} cookie(s) injecté(s).")
+        else:
+            print("[PLAYWRIGHT WARN] Aucun cookie à injecter !")
+
+        # --- Anti-détection ---
         await context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['fr-CA', 'fr', 'en-US', 'en']});
+            window.chrome = { runtime: {} };
         """)
 
         page = await context.new_page()
 
-        url = f"{team_url}?tab=schedule"
-        print(f"[PLAYWRIGHT] Navigation vers {url}")
+        print(f"[PLAYWRIGHT] Navigation vers {team_url}")
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await page.goto(team_url, wait_until="domcontentloaded", timeout=45000)
         except Exception as e:
-            print(f"[PLAYWRIGHT ERROR] Navigation: {e}")
+            print(f"[PLAYWRIGHT ERROR] goto: {e}")
             await browser.close()
             return None
 
-        # Attendre que la page soit prête (Cloudflare inclus)
-        print("[PLAYWRIGHT] Attente de la page...")
-        for i in range(40):
+        # Attendre la fin éventuelle de Cloudflare
+        for i in range(30):
             title = (await page.title()).lower()
             if "un instant" not in title and "just a moment" not in title:
+                print(f"[PLAYWRIGHT] Cloudflare OK après {i+1}s (titre: '{await page.title()}')")
+                break
+            if i % 5 == 0:
+                print(f"[PLAYWRIGHT] Challenge en cours ({i+1}s)...")
+            await page.wait_for_timeout(1000)
+        else:
+            print("[PLAYWRIGHT ERROR] Cloudflare non franchi.")
+            await browser.close()
+            return None
+
+        # Attendre que la page soit prête
+        await page.wait_for_timeout(3000)
+
+        # --- Attendre que les skeletons disparaissent ---
+        print("[PLAYWRIGHT] Attente fin du chargement (skeletons)...")
+        for i in range(20):
+            sk = await page.locator(".spdl-skeleton").count()
+            if sk == 0:
+                print(f"[PLAYWRIGHT] Skeletons disparus après {i+1}s")
                 break
             await page.wait_for_timeout(1000)
-        print(f"[PLAYWRIGHT] Titre: '{await page.title()}'")
 
-        # Attendre que le contenu de l'horaire soit là
+        # --- Étape clic 1 : ouvrir le dropdown ---
+        print("\n[PLAYWRIGHT] Clic 1/3 : ouvrir le dropdown de filtre")
         try:
-            await page.wait_for_selector("text=7 prochains jours", timeout=20000)
-            print("[PLAYWRIGHT] Bouton '7 prochains jours' détecté.")
-        except Exception as e:
-            print(f"[PLAYWRIGHT WARN] Bouton filtre non trouvé: {e}")
-
-        # Étape 1 : cliquer sur le bouton de filtre (dropdown)
-        try:
-            # Le bouton contient le texte "7 prochains jours"
-            await page.locator("button:has-text('prochains jours'), button:has-text('prochain jour')").first.click(timeout=10000)
-            print("[PLAYWRIGHT] Dropdown du filtre ouvert.")
+            btn = page.locator("button:has-text('prochains jours'), button:has-text('prochain jour'), button:has-text('jours')").first
+            await btn.wait_for(state="visible", timeout=15000)
+            await btn.click(timeout=5000)
+            print("[PLAYWRIGHT] ✓ Dropdown ouvert")
             await page.wait_for_timeout(1500)
         except Exception as e:
-            print(f"[PLAYWRIGHT WARN] Impossible d'ouvrir le dropdown: {e}")
+            print(f"[PLAYWRIGHT] ✗ Échec clic 1 : {e}")
+            # Sauvegarde pour debug
+            try:
+                with open("/share/schedule_debug_fail.html", "w", encoding="utf-8") as f:
+                    f.write(await page.content())
+                print("[PLAYWRIGHT] HTML sauvegardé: /share/schedule_debug_fail.html")
+            except Exception:
+                pass
 
-        # Étape 2 : cliquer sur "Saison 2026-27"
+        # --- Étape clic 2 : cliquer 'Saison 2026-27' ---
+        print("\n[PLAYWRIGHT] Clic 2/3 : 'Saison 2026-27'")
         try:
-            await page.locator("li:has-text('Saison 2026-27')").first.click(timeout=10000)
-            print("[PLAYWRIGHT] 'Saison 2026-27' cliqué.")
-            await page.wait_for_timeout(800)
+            li = page.locator("li:has-text('Saison')").first
+            await li.wait_for(state="visible", timeout=10000)
+            await li.click(timeout=5000)
+            print("[PLAYWRIGHT] ✓ Saison cliquée")
+            await page.wait_for_timeout(1000)
         except Exception as e:
-            print(f"[PLAYWRIGHT WARN] 'Saison 2026-27' non cliqué: {e}")
+            print(f"[PLAYWRIGHT] ✗ Échec clic 2 : {e}")
 
-        # Étape 3 : cliquer sur "Appliquer"
+        # --- Étape clic 3 : cliquer 'Appliquer' ---
+        print("\n[PLAYWRIGHT] Clic 3/3 : 'Appliquer'")
         try:
-            await page.locator("button:has-text('Appliquer')").first.click(timeout=10000)
-            print("[PLAYWRIGHT] 'Appliquer' cliqué.")
+            btn = page.locator("button:has-text('Appliquer')").first
+            await btn.wait_for(state="visible", timeout=10000)
+            await btn.click(timeout=5000)
+            print("[PLAYWRIGHT] ✓ Appliquer cliqué")
         except Exception as e:
-            print(f"[PLAYWRIGHT WARN] 'Appliquer' non cliqué: {e}")
+            print(f"[PLAYWRIGHT] ✗ Échec clic 3 : {e}")
 
-        # Attendre le rechargement des matchs
-        print("[PLAYWRIGHT] Attente du chargement des matchs...")
-        await page.wait_for_timeout(5000)
-
-        # Attendre qu'il n'y ait plus de skeleton de chargement
-        for _ in range(10):
-            skeletons = await page.locator(".spdl-skeleton").count()
-            if skeletons == 0:
+        # --- Attendre le rechargement des matchs ---
+        print("\n[PLAYWRIGHT] Attente chargement des matchs...")
+        for i in range(30):
+            sk = await page.locator(".spdl-skeleton").count()
+            arts = await page.locator("article[itemtype*='SportsEvent']").count()
+            if sk == 0 and arts > 0:
+                print(f"[PLAYWRIGHT] ✓ {arts} match(s) chargés après {i+1}s")
                 break
+            if i % 5 == 0:
+                print(f"[PLAYWRIGHT] ...en cours ({i+1}s, {arts} articles)")
             await page.wait_for_timeout(1000)
 
+        await page.wait_for_timeout(2000)
         html = await page.content()
-        print(f"[PLAYWRIGHT OK] HTML récupéré: {len(html)} octets")
+        print(f"\n[PLAYWRIGHT OK] HTML final: {len(html)} octets")
 
-        # Debug : sauvegarder
         try:
             with open("/share/schedule_debug.html", "w", encoding="utf-8") as f:
                 f.write(html)
+            print("[PLAYWRIGHT] HTML sauvegardé dans /share/schedule_debug.html")
         except Exception:
             pass
+
+        # Compter les sections de date
+        count = html.count('data-date-section')
+        print(f"[PLAYWRIGHT] {count} section(s) data-date-section détectée(s).")
 
         await browser.close()
         return html
 
 
-# ---------- FLARESOLVERR (pour roster + stats) ----------
+# ============================================================
+# FLARESOLVERR (pour roster + stats)
+# ============================================================
 
 async def fetch_with_flaresolverr(session, url, key_name):
     print(f"\n[FLARESOLVERR] Requête '{key_name}': {url}")
@@ -168,7 +282,9 @@ async def fetch_with_flaresolverr(session, url, key_name):
     return html
 
 
-# ---------- MQTT ----------
+# ============================================================
+# MQTT
+# ============================================================
 
 def publish_to_mqtt(topic, payload):
     try:
@@ -187,7 +303,9 @@ def publish_to_mqtt(topic, payload):
         print(f"[MQTT ERROR] {topic}: {e}")
 
 
-# ---------- PARSING SCHEDULE ----------
+# ============================================================
+# PARSING SCHEDULE
+# ============================================================
 
 _JOURS_FR = ["LUN", "MAR", "MER", "JEU", "VEN", "SAM", "DIM"]
 _MOIS_FR = ["JANV", "FÉVR", "MARS", "AVR", "MAI", "JUIN",
@@ -203,22 +321,20 @@ def _iso_to_date_fr(iso):
 
 
 def parse_schedule_cards(html: str):
-    """Parse les cartes de match depuis le HTML rendu par Playwright."""
     soup = BeautifulSoup(html, "html.parser")
     matchs = []
 
-    # Chaque match est dans un <article itemprop="item" itemtype=".../SportsEvent">
     articles = soup.find_all("article", attrs={"itemtype": re.compile("SportsEvent", re.I)})
     print(f"[SCHEDULE] {len(articles)} article(s) SportsEvent trouvé(s).")
 
-    for art in articles:
-        # Aréna : adresse dans le header
+    for idx, art in enumerate(articles):
+        # Aréna
         arena = ""
         addr = art.find("address")
         if addr:
             arena = addr.get_text(" ", strip=True)
 
-        # Numéro de match : <span class="EventCard_scheduleType...">ven. 2 oct. • P-2026</span>
+        # Numéro
         num_match = ""
         sched_type = art.find("span", class_=re.compile("scheduleType", re.I))
         if sched_type:
@@ -227,53 +343,36 @@ def parse_schedule_cards(html: str):
             if m:
                 num_match = m.group(0)
 
-        # Date/heure : <time datetime="..."> + <div class="font-brand font-size-lg">09 h 00</div>
+        # Date/heure via <time>
+        iso = ""
         date_fr = ""
         heure_fr = ""
-        iso = ""
         t = art.find("time")
         if t:
             iso = t.get("datetime", "")
             if iso:
-                date_fr, heure_fr_from_iso = _iso_to_date_fr(iso)
-        # Heure affichée dans le html
-        heure_div = art.find("div", class_=re.compile("font-brand font-size-lg", re.I))
-        if heure_div:
-            heure_txt = heure_div.get_text(strip=True)
-            m = re.match(r'(\d{1,2})\s*h\s*(\d{2})', heure_txt)
-            if m:
-                heure_fr = f"{m.group(1)}h{m.group(2)}"
-        if not heure_fr and iso:
-            _, heure_fr = _iso_to_date_fr(iso)
+                date_fr, heure_fr = _iso_to_date_fr(iso)
 
-        # Équipes : chercher les 2 <article ...SportsTeam>
-        teams = art.find_all("article", attrs={"itemtype": re.compile("SportsTeam", re.I)})
+        # Score + statut
+        score = ""
+        status = "À VENIR"
+        final_el = art.find(string=re.compile(r'^\s*(FINAL|EN COURS|PROLONGATION|FUSILLADE)\s*$', re.I))
+        if final_el:
+            status = final_el.strip().upper()
+            score_divs = art.find_all("div", class_=re.compile("font-brand font-size-lg", re.I))
+            digits = [d.get_text(strip=True) for d in score_divs if d.get_text(strip=True).isdigit()]
+            if len(digits) >= 2:
+                score = f"{digits[0]}-{digits[1]}"
+
+        # Équipes
         equipes = []
+        teams = art.find_all("article", attrs={"itemtype": re.compile("SportsTeam", re.I)})
         for t_art in teams:
             name_el = t_art.find(attrs={"itemprop": "name"})
             if name_el:
                 a = name_el.find("a")
                 if a:
                     equipes.append(a.get_text(strip=True))
-
-        # Score : chercher "FINAL" ou les nombres à côté
-        # Structure : <i class="mdi mdi-menu-right"></i>1<div>FINAL</div>0<i ...>
-        score = ""
-        status = ""
-        final_div = art.find(string=re.compile(r'^\s*(FINAL|EN COURS|À VENIR)\s*$', re.I))
-        if final_div:
-            status = final_div.strip().upper()
-            # Les scores sont dans les divs font-brand font-size-lg
-            score_divs = art.find_all("div", class_=re.compile("font-brand font-size-lg", re.I))
-            if len(score_divs) >= 2:
-                # Le premier est le score équipe gauche, le dernier équipe droite
-                s1 = score_divs[0].get_text(strip=True)
-                s2 = score_divs[-1].get_text(strip=True)
-                if s1.isdigit() and s2.isdigit():
-                    score = f"{s1}-{s2}"
-        else:
-            # Pas de score => match à venir (structure avec time)
-            status = "À VENIR"
 
         joue = bool(score)
         match = {
@@ -288,12 +387,14 @@ def parse_schedule_cards(html: str):
             "joue": joue,
         }
         matchs.append(match)
-        print(f"   → {date_fr} {heure_fr} | {arena[:60]} | {equipes} | score={score or '-'} | {status}")
+        print(f"   [{idx+1}] {date_fr} {heure_fr} | {arena[:55]} | {equipes} | {score or '-'} | {status}")
 
     return matchs
 
 
-# ---------- PARSING ROSTER ----------
+# ============================================================
+# PARSING ROSTER
+# ============================================================
 
 def split_name_and_number(raw: str):
     raw = raw.strip()
@@ -375,22 +476,33 @@ def parse_table_generic(html: str, debug_name: str = "generic"):
     return rows
 
 
-# ---------- MAIN ----------
+# ============================================================
+# MAIN
+# ============================================================
 
 async def scrape_and_publish():
-    print(f"\n{'='*50}")
-    print(f"[START] RseqHockey v2.7.0 (Playwright schedule) - {MY_TEAM_NAME}")
-    print(f"{'='*50}")
+    print(f"\n{'='*60}")
+    print(f"[START] RseqHockey v2.8.0 - {MY_TEAM_NAME}")
+    print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
     team_url = f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}"
 
-    # --- 1. Horaire : Playwright avec clics ---
-    schedule_html = await fetch_schedule_with_clicks(team_url)
-
-    # --- 2. Roster + Stats : FlareSolverr ---
     timeout = aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT + 30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+
+        # --- 1. FlareSolverr pour obtenir les cookies Cloudflare ---
+        cookies, user_agent = await get_cloudflare_cookies(session)
+        if not cookies:
+            print("[ABORT] Impossible d'obtenir les cookies Cloudflare.")
+            return
+
+        # --- 2. Playwright avec cookies ---
+        schedule_html = await fetch_schedule_with_playwright(
+            f"{team_url}?tab=schedule", cookies, user_agent
+        )
+
+        # --- 3. FlareSolverr pour roster + stats ---
         roster_html = await fetch_with_flaresolverr(session, f"{team_url}?tab=roster", "roster")
         stats_html = await fetch_with_flaresolverr(
             session,
@@ -398,7 +510,6 @@ async def scrape_and_publish():
             "stats_saison_reguliere"
         )
 
-    # --- PARSING ---
     print("\n[PARSING]...")
     matchs = parse_schedule_cards(schedule_html) if schedule_html else []
     roster_data = parse_roster_structured(roster_html) if roster_html else {"gardiens": [], "joueurs": [], "personnel": []}
@@ -406,15 +517,13 @@ async def scrape_and_publish():
 
     joues = [m for m in matchs if m["joue"]]
     a_venir = [m for m in matchs if not m["joue"]]
-
-    # Trier par date ISO
     joues.sort(key=lambda m: m.get("iso", ""))
     a_venir.sort(key=lambda m: m.get("iso", ""))
 
     last_match = joues[-1] if joues else None
     next_match = a_venir[0] if a_venir else None
 
-    print(f"[STATS] {len(joues)} joué(s), {len(a_venir)} à venir.")
+    print(f"\n[STATS] {len(joues)} joué(s), {len(a_venir)} à venir.")
     if last_match:
         print(f"   Dernier: {last_match['date']} {last_match['equipes']} {last_match['score']}")
     if next_match:
@@ -425,7 +534,6 @@ async def scrape_and_publish():
         None
     ) if TRACKED_PLAYER else None
 
-    # --- MQTT ---
     print("\n[MQTT] Publication...")
 
     def build_config(name, oid, st, at, icon):
@@ -437,7 +545,6 @@ async def scrape_and_publish():
         print(f"\n[MQTT DISCOVERY] {topic}")
         publish_to_mqtt(topic, cfg)
 
-    # Roster
     total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config",
@@ -448,7 +555,6 @@ async def scrape_and_publish():
                     f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
-    # Prochain match
     if next_match:
         state = f"{next_match['date']} {next_match['heure']} - {next_match['arene']}"
     else:
@@ -465,7 +571,6 @@ async def scrape_and_publish():
         "nb_total": len(matchs),
     })
 
-    # Dernier match
     if last_match:
         if len(last_match["equipes"]) >= 2:
             last_state = f"{last_match['date']} : {' '.join(last_match['equipes'])} {last_match['score']}"
@@ -484,7 +589,6 @@ async def scrape_and_publish():
         "tous_les_matchs_joues": joues,
     })
 
-    # Joueur suivi
     if TRACKED_PLAYER:
         ps = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
         pts = player_info_sr.get("PTS", "0") if player_info_sr else "0"
@@ -496,7 +600,6 @@ async def scrape_and_publish():
         publish_to_mqtt(f"rseqhockey/player/{ps}/state", f"SR: {pts} pts")
         publish_to_mqtt(f"rseqhockey/player/{ps}/attributes", {"stats_saison_reguliere": player_info_sr})
 
-    # Stats saison
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config",
         build_config(f"RSEQ Stats Saison", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere",
