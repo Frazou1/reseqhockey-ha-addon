@@ -1,16 +1,7 @@
-FROM python:3.11-slim
-
+FROM mcr.microsoft.com/playwright/python:v1.63.0-jammy
 WORKDIR /app
-
-# Dépendances système minimales (utile pour certaines wheels Python)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
 COPY . .
-
 RUN chmod +x run.sh
 CMD [ "/app/run.sh" ]
