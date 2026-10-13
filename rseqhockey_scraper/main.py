@@ -241,25 +241,35 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
 
 
 # ============================================================
-# FLARESOLVERR (pour roster + stats)
+# FLARESOLVERR (pour roster + stats) — avec retry
 # ============================================================
 
-async def fetch_with_flaresolverr(session, url, key_name):
-    print(f"\n[FLARESOLVERR] Requête '{key_name}': {url}")
-    payload = {"cmd": "request.get", "url": url, "maxTimeout": FLARESOLVERR_TIMEOUT * 1000}
-    try:
-        async with session.post(FLARESOLVERR_URL, json=payload) as resp:
-            data = await resp.json()
-    except Exception as e:
-        print(f"[FLARESOLVERR ERROR '{key_name}'] {e}")
-        return None
-    if data.get("status") != "ok":
-        print(f"[FLARESOLVERR ERROR '{key_name}'] {data.get('message')}")
-        return None
-    html = data.get("solution", {}).get("response", "")
-    if html:
-        print(f"[FLARESOLVERR OK '{key_name}'] {len(html)} octets")
-    return html
+async def fetch_with_flaresolverr(session, url, key_name, retries=2):
+    for attempt in range(retries):
+        print(f"\n[FLARESOLVERR] Requête '{key_name}' (essai {attempt+1}/{retries}): {url}")
+        payload = {"cmd": "request.get", "url": url, "maxTimeout": FLARESOLVERR_TIMEOUT * 1000}
+        try:
+            async with session.post(FLARESOLVERR_URL, json=payload) as resp:
+                data = await resp.json()
+        except Exception as e:
+            print(f"[FLARESOLVERR ERROR '{key_name}'] essai {attempt+1}: {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(5)
+            continue
+
+        if data.get("status") == "ok":
+            html = data.get("solution", {}).get("response", "")
+            if html:
+                print(f"[FLARESOLVERR OK '{key_name}'] {len(html)} octets")
+                return html
+        else:
+            print(f"[FLARESOLVERR ERROR '{key_name}'] essai {attempt+1}: {data.get('message')}")
+
+        if attempt < retries - 1:
+            print(f"[FLARESOLVERR] Retry dans 5s...")
+            await asyncio.sleep(5)
+
+    return None
 
 
 # ============================================================
@@ -493,61 +503,58 @@ def parse_schedule_cards(html: str):
 # ============================================================
 
 def _extract_name_from_cell(td):
-    """
-    Extrait un nom propre depuis une cellule <td>.
-    Spordle utilise : <div title="PRÉNOM NOM"><a>PRÉNOM NOM</a></div>
-    """
-    # Stratégie 1 : attribut title sur un div
     for div in td.find_all("div"):
         title = div.get("title", "").strip()
         if title and len(title) > 2 and not title.isdigit():
             return title
-
-    # Stratégie 2 : attribut title sur un span
     for sp in td.find_all("span"):
         title = sp.get("title", "").strip()
         if title and len(title) > 2 and not title.isdigit():
             return title
-
-    # Stratégie 3 : balise <a> (contient le nom complet)
     a = td.find("a")
     if a:
         txt = a.get_text(strip=True)
         if txt and len(txt) > 2 and not txt.isdigit():
             return txt
-
-    # Stratégie 4 : span avec class text-truncate (utilisé pour le personnel)
     sp = td.find("span", class_=re.compile("text-truncate", re.I))
     if sp:
         txt = sp.get_text(strip=True)
         if txt and len(txt) > 2:
             return txt
-
     return ""
 
 
 def _extract_number_from_cell(td_name, td_num):
     """
-    Extrait le numéro. Spordle le met généralement dans la 2e cellule
-    (<td>35</td>) ou dans un span du nom.
+    Extrait le numéro de maillot. Cherche dans :
+    1. Un span avec class contenant 'jersey'/'number'/'num'
+    2. Le title du div ("ANNABELLE MICHAUD 35")
+    3. Toutes les <td> du <tr> avec un ID contenant 'number'/'jersey'
     """
-    # Stratégie 1 : dans le td suivant
-    txt = td_num.get_text(strip=True)
-    if txt and txt.isdigit():
-        return txt
-
-    # Stratégie 2 : dans un span du td du nom
+    # Stratégie 1 : classe jersey/number
     for sp in td_name.find_all("span"):
-        txt = sp.get_text(strip=True)
-        if txt and txt.isdigit():
-            return txt
+        classes = " ".join(sp.get("class", [])).lower()
+        if "jersey" in classes or "number" in classes:
+            txt = sp.get_text(strip=True)
+            if txt.isdigit():
+                return txt
 
-    # Stratégie 3 : extraire du title du div (ex: "ANNABELLE MICHAUD 35")
+    # Stratégie 2 : title du div avec numéro à la fin
     for div in td_name.find_all("div"):
         title = div.get("title", "")
         m = re.search(r'\s(\d{1,2})$', title)
         if m:
             return m.group(1)
+
+    # Stratégie 3 : chercher dans le <tr> une cellule dont l'ID contient 'number'/'jersey'
+    tr = td_name.find_parent("tr")
+    if tr:
+        for td in tr.find_all("td"):
+            td_id = (td.get("id") or "").lower()
+            if "number" in td_id or "jersey" in td_id:
+                txt = td.get_text(strip=True)
+                if txt.isdigit():
+                    return txt
 
     return ""
 
@@ -582,7 +589,7 @@ def parse_roster_structured(html: str):
                         "numero": num,
                         "stats": dict(zip(headers, [td.get_text(strip=True) for td in tds]))
                     })
-                    print(f"   → {nom} (#{num})")
+                    print(f"   → {nom} (#{num or '?'})")
 
         elif "joueurs" in hs:
             print(f"\n[ROSTER] Table JOUEURS")
@@ -598,7 +605,7 @@ def parse_roster_structured(html: str):
                         "numero": num,
                         "stats": dict(zip(headers, [td.get_text(strip=True) for td in tds]))
                     })
-                    print(f"   → {nom} (#{num})")
+                    print(f"   → {nom} (#{num or '?'})")
 
         elif any("personnel" in h.lower() for h in headers):
             print(f"\n[ROSTER] Table PERSONNEL")
@@ -647,13 +654,13 @@ def parse_table_generic(html: str, debug_name: str = "generic"):
 
 async def scrape_and_publish():
     print(f"\n{'='*60}")
-    print(f"[START] RseqHockey v3.1.0 - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v3.2.0 - {MY_TEAM_NAME}")
     print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
     team_url = f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}"
 
-    timeout = aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT + 30)
+    timeout = aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT + 60)
     async with aiohttp.ClientSession(timeout=timeout) as session:
 
         cookies, user_agent = await get_cloudflare_cookies(session)
