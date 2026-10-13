@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import aiohttp
 from bs4 import BeautifulSoup
 import paho.mqtt.client as mqtt
+from playwright.async_api import async_playwright
 
 with open("/data/options.json", "r") as f:
     config = json.load(f)
@@ -25,17 +26,7 @@ INTERVAL = config.get("update_interval_hours", 6) * 3600
 FLARESOLVERR_URL = config.get("flaresolverr_url", "http://192.168.1.65:8191/v1")
 FLARESOLVERR_TIMEOUT = config.get("flaresolverr_timeout", 90)
 
-# --- API Spordle ---
-SPORDLE_API = "https://pub-api.play.spordle.com/api"
-SPORDLE_API_KEY = "f08ed9064e3cdc382e6abb305ff543d0150fb52f"
-OFFICE_ID = 6241
-CATEGORY_ID = "ae5bed83-a302-4ac5-927b-639d2c20a3c9"
-SEASON_ID = "2026-27"
-SEASON_START = config.get("season_start", "2026-09-19")
-SEASON_END = config.get("season_end", "2027-04-01")
-TIMEZONE = config.get("timezone", "America/Toronto")
-
-LEAGUE_UUID = CATEGORY_ID
+LEAGUE_UUID = "ae5bed83-a302-4ac5-927b-639d2c20a3c9"
 SCHEDULE_SAISON_REGULIERE = "198862"
 
 LOGOS_DIR = "/share/rseqhockey_logos"
@@ -55,74 +46,106 @@ DEVICE_INFO = {
     "manufacturer": "Spordle / RSEQ"
 }
 
-API_HEADERS = {
-    "x-api-key": SPORDLE_API_KEY,
-    "Origin": "https://scolaire.rseqhockey.com",
-    "Referer": "https://scolaire.rseqhockey.com/",
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-}
 
+# ---------- PLAYWRIGHT : clics automatisés sur l'horaire ----------
 
-# ---------- API SPORDLE ----------
+async def fetch_schedule_with_clicks(team_url):
+    """
+    Ouvre la page horaire, clique sur 'Saison 2026-27' puis 'Appliquer',
+    et retourne le HTML une fois la liste des matchs chargée.
+    """
+    print(f"\n[PLAYWRIGHT] Démarrage du navigateur pour l'horaire...")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"],
+        )
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            locale="fr-CA",
+        )
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+        """)
 
-async def api_get_games(session):
-    filt = {
-        "order": ["startTime ASC", "number ASC"],
-        "where": {
-            "and": [
-                {"date": {"between": [SEASON_START, SEASON_END]}},
-                {"or": [{"awayTeamId": int(TEAM_ID)}, {"homeTeamId": int(TEAM_ID)}]},
-                {"officeId": OFFICE_ID},
-            ]
-        },
-        "include": ["teamStats", "surface", "office", "category",
-                    "awayTeam", "homeTeam", "externalProviders"],
-    }
-    filt_str = json.dumps(filt, separators=(',', ':'))
-    url = f"{SPORDLE_API}/sp/games"
-    params = {"filter": filt_str}
+        page = await context.new_page()
 
-    print(f"\n[API] GET {url}")
-    try:
-        async with session.get(url, params=params, headers=API_HEADERS,
-                               timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            print(f"[API] HTTP {resp.status}")
-            if resp.status == 200:
-                data = await resp.json()
-                print(f"[API OK] {len(data) if isinstance(data, list) else '?'} game(s)")
-                return data
-            else:
-                txt = await resp.text()
-                print(f"[API ERROR] {resp.status}: {txt[:300]}")
-    except Exception as e:
-        print(f"[API ERROR] {e}")
-    return None
+        url = f"{team_url}?tab=schedule"
+        print(f"[PLAYWRIGHT] Navigation vers {url}")
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        except Exception as e:
+            print(f"[PLAYWRIGHT ERROR] Navigation: {e}")
+            await browser.close()
+            return None
 
+        # Attendre que la page soit prête (Cloudflare inclus)
+        print("[PLAYWRIGHT] Attente de la page...")
+        for i in range(40):
+            title = (await page.title()).lower()
+            if "un instant" not in title and "just a moment" not in title:
+                break
+            await page.wait_for_timeout(1000)
+        print(f"[PLAYWRIGHT] Titre: '{await page.title()}'")
 
-async def api_get_standings(session):
-    """Classement via l'API."""
-    url = f"{SPORDLE_API}/sp/standings"
-    filt = {
-        "where": {"and": [
-            {"categoryId": CATEGORY_ID},
-            {"officeId": OFFICE_ID},
-        ]},
-        "include": ["team"],
-    }
-    params = {"filter": json.dumps(filt, separators=(',', ':'))}
-    try:
-        async with session.get(url, params=params, headers=API_HEADERS,
-                               timeout=aiohttp.ClientTimeout(total=20)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                print(f"[API STANDINGS OK] {len(json.dumps(data))} octets")
-                return data
-            else:
-                print(f"[API STANDINGS] HTTP {resp.status}")
-    except Exception as e:
-        print(f"[API STANDINGS ERROR] {e}")
-    return None
+        # Attendre que le contenu de l'horaire soit là
+        try:
+            await page.wait_for_selector("text=7 prochains jours", timeout=20000)
+            print("[PLAYWRIGHT] Bouton '7 prochains jours' détecté.")
+        except Exception as e:
+            print(f"[PLAYWRIGHT WARN] Bouton filtre non trouvé: {e}")
+
+        # Étape 1 : cliquer sur le bouton de filtre (dropdown)
+        try:
+            # Le bouton contient le texte "7 prochains jours"
+            await page.locator("button:has-text('prochains jours'), button:has-text('prochain jour')").first.click(timeout=10000)
+            print("[PLAYWRIGHT] Dropdown du filtre ouvert.")
+            await page.wait_for_timeout(1500)
+        except Exception as e:
+            print(f"[PLAYWRIGHT WARN] Impossible d'ouvrir le dropdown: {e}")
+
+        # Étape 2 : cliquer sur "Saison 2026-27"
+        try:
+            await page.locator("li:has-text('Saison 2026-27')").first.click(timeout=10000)
+            print("[PLAYWRIGHT] 'Saison 2026-27' cliqué.")
+            await page.wait_for_timeout(800)
+        except Exception as e:
+            print(f"[PLAYWRIGHT WARN] 'Saison 2026-27' non cliqué: {e}")
+
+        # Étape 3 : cliquer sur "Appliquer"
+        try:
+            await page.locator("button:has-text('Appliquer')").first.click(timeout=10000)
+            print("[PLAYWRIGHT] 'Appliquer' cliqué.")
+        except Exception as e:
+            print(f"[PLAYWRIGHT WARN] 'Appliquer' non cliqué: {e}")
+
+        # Attendre le rechargement des matchs
+        print("[PLAYWRIGHT] Attente du chargement des matchs...")
+        await page.wait_for_timeout(5000)
+
+        # Attendre qu'il n'y ait plus de skeleton de chargement
+        for _ in range(10):
+            skeletons = await page.locator(".spdl-skeleton").count()
+            if skeletons == 0:
+                break
+            await page.wait_for_timeout(1000)
+
+        html = await page.content()
+        print(f"[PLAYWRIGHT OK] HTML récupéré: {len(html)} octets")
+
+        # Debug : sauvegarder
+        try:
+            with open("/share/schedule_debug.html", "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception:
+            pass
+
+        await browser.close()
+        return html
 
 
 # ---------- FLARESOLVERR (pour roster + stats) ----------
@@ -164,116 +187,109 @@ def publish_to_mqtt(topic, payload):
         print(f"[MQTT ERROR] {topic}: {e}")
 
 
-# ---------- UTILS ----------
+# ---------- PARSING SCHEDULE ----------
 
 _JOURS_FR = ["LUN", "MAR", "MER", "JEU", "VEN", "SAM", "DIM"]
 _MOIS_FR = ["JANV", "FÉVR", "MARS", "AVR", "MAI", "JUIN",
             "JUIL", "AOÛT", "SEPT", "OCT", "NOV", "DÉC"]
 
 
-def iso_to_local_parts(iso_str, tz_name):
-    """Convertit un ISO UTC en (date_fr, heure_fr, iso_local)."""
-    if not iso_str:
-        return "", "", ""
+def _iso_to_date_fr(iso):
     try:
-        # Parse ISO UTC
-        dt_utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        # Convertir en local
-        tz = ZoneInfo(tz_name)
-        dt_local = dt_utc.astimezone(tz)
-        date_fr = f"{_JOURS_FR[dt_local.weekday()]}. {dt_local.day} {_MOIS_FR[dt_local.month - 1]}."
-        heure_fr = dt_local.strftime("%Hh%M")
-        return date_fr, heure_fr, dt_local.isoformat()
-    except Exception as e:
-        print(f"[TZ ERROR] {iso_str}: {e}")
-        return iso_str, "", iso_str
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(ZoneInfo("America/Toronto"))
+        return f"{_JOURS_FR[dt.weekday()]}. {dt.day} {_MOIS_FR[dt.month-1]}.", dt.strftime("%Hh%M")
+    except Exception:
+        return iso, ""
 
 
-def parse_games(api_data):
-    """Parse la liste des matchs depuis l'API."""
-    if not api_data or not isinstance(api_data, list):
-        print("[PARSE GAMES] Pas de données.")
-        return []
-
+def parse_schedule_cards(html: str):
+    """Parse les cartes de match depuis le HTML rendu par Playwright."""
+    soup = BeautifulSoup(html, "html.parser")
     matchs = []
-    for g in api_data:
-        if not isinstance(g, dict):
-            continue
 
-        # Date + heure (conversion UTC → local)
-        iso = g.get("startTime", "")
-        tz_name = g.get("timezone", TIMEZONE)
-        date_fr, heure_fr, iso_local = iso_to_local_parts(iso, tz_name)
+    # Chaque match est dans un <article itemprop="item" itemtype=".../SportsEvent">
+    articles = soup.find_all("article", attrs={"itemtype": re.compile("SportsEvent", re.I)})
+    print(f"[SCHEDULE] {len(articles)} article(s) SportsEvent trouvé(s).")
 
-        # Aréna
-        surface = g.get("surface") or {}
-        venue = surface.get("venue") or {}
-        arena_parts = []
-        if venue.get("name"):
-            arena_parts.append(venue["name"])
-        if surface.get("name") and surface["name"].lower() not in (venue.get("name", "").lower(),):
-            arena_parts.append(f"({surface['name']})")
-        if venue.get("city"):
-            arena_parts.append(f"- {venue['city']}")
-        arena = " ".join(arena_parts) if arena_parts else ""
+    for art in articles:
+        # Aréna : adresse dans le header
+        arena = ""
+        addr = art.find("address")
+        if addr:
+            arena = addr.get_text(" ", strip=True)
 
-        # Équipes
-        home = (g.get("homeTeam") or {}).get("name", "")
-        away = (g.get("awayTeam") or {}).get("name", "")
+        # Numéro de match : <span class="EventCard_scheduleType...">ven. 2 oct. • P-2026</span>
+        num_match = ""
+        sched_type = art.find("span", class_=re.compile("scheduleType", re.I))
+        if sched_type:
+            txt = sched_type.get_text(" ", strip=True)
+            m = re.search(r'P-?\d+', txt)
+            if m:
+                num_match = m.group(0)
 
-        # Score (dict {teamId: score})
-        score_dict = g.get("score") or {}
-        home_score = score_dict.get(str(g.get("homeTeamId"))) or score_dict.get(g.get("homeTeamId"))
-        away_score = score_dict.get(str(g.get("awayTeamId"))) or score_dict.get(g.get("awayTeamId"))
+        # Date/heure : <time datetime="..."> + <div class="font-brand font-size-lg">09 h 00</div>
+        date_fr = ""
+        heure_fr = ""
+        iso = ""
+        t = art.find("time")
+        if t:
+            iso = t.get("datetime", "")
+            if iso:
+                date_fr, heure_fr_from_iso = _iso_to_date_fr(iso)
+        # Heure affichée dans le html
+        heure_div = art.find("div", class_=re.compile("font-brand font-size-lg", re.I))
+        if heure_div:
+            heure_txt = heure_div.get_text(strip=True)
+            m = re.match(r'(\d{1,2})\s*h\s*(\d{2})', heure_txt)
+            if m:
+                heure_fr = f"{m.group(1)}h{m.group(2)}"
+        if not heure_fr and iso:
+            _, heure_fr = _iso_to_date_fr(iso)
+
+        # Équipes : chercher les 2 <article ...SportsTeam>
+        teams = art.find_all("article", attrs={"itemtype": re.compile("SportsTeam", re.I)})
+        equipes = []
+        for t_art in teams:
+            name_el = t_art.find(attrs={"itemprop": "name"})
+            if name_el:
+                a = name_el.find("a")
+                if a:
+                    equipes.append(a.get_text(strip=True))
+
+        # Score : chercher "FINAL" ou les nombres à côté
+        # Structure : <i class="mdi mdi-menu-right"></i>1<div>FINAL</div>0<i ...>
         score = ""
-        if home_score is not None and away_score is not None:
-            score = f"{away_score}-{home_score}"
+        status = ""
+        final_div = art.find(string=re.compile(r'^\s*(FINAL|EN COURS|À VENIR)\s*$', re.I))
+        if final_div:
+            status = final_div.strip().upper()
+            # Les scores sont dans les divs font-brand font-size-lg
+            score_divs = art.find_all("div", class_=re.compile("font-brand font-size-lg", re.I))
+            if len(score_divs) >= 2:
+                # Le premier est le score équipe gauche, le dernier équipe droite
+                s1 = score_divs[0].get_text(strip=True)
+                s2 = score_divs[-1].get_text(strip=True)
+                if s1.isdigit() and s2.isdigit():
+                    score = f"{s1}-{s2}"
+        else:
+            # Pas de score => match à venir (structure avec time)
+            status = "À VENIR"
 
-        # Résultat pour notre équipe
-        our_score = None
-        opp_score = None
-        result = ""
-        if str(TEAM_ID) == str(g.get("homeTeamId")):
-            our_score = home_score
-            opp_score = away_score
-        elif str(TEAM_ID) == str(g.get("awayTeamId")):
-            our_score = away_score
-            opp_score = home_score
-
-        if our_score is not None and opp_score is not None:
-            if our_score > opp_score:
-                result = "V"
-            elif our_score < opp_score:
-                result = "D"
-            else:
-                result = "N"
-
-        # Est-ce joué ?
-        played = g.get("actualEndTime") is not None or bool(score)
-
+        joue = bool(score)
         match = {
-            "numero": g.get("number", ""),
+            "numero": num_match,
             "date": date_fr,
-            "date_iso": g.get("date", ""),
             "heure": heure_fr,
-            "iso_local": iso_local,
+            "iso": iso,
             "arene": arena,
-            "equipe_domicile": home,
-            "equipe_visiteur": away,
-            "equipes": [e for e in [away, home] if e],
+            "equipes": equipes,
             "score": score,
-            "notre_score": our_score,
-            "score_adversaire": opp_score,
-            "resultat": result,
-            "joue": played,
-            "is_live": g.get("isLive", False),
-            "statut": g.get("status", ""),
+            "statut": status,
+            "joue": joue,
         }
         matchs.append(match)
+        print(f"   → {date_fr} {heure_fr} | {arena[:60]} | {equipes} | score={score or '-'} | {status}")
 
-    # Trier par date ISO
-    matchs.sort(key=lambda m: m.get("date_iso", ""))
-    print(f"[PARSE GAMES] {len(matchs)} match(s) au total.")
     return matchs
 
 
@@ -308,8 +324,8 @@ def parse_roster_structured(html: str):
         headers = [th.get_text(strip=True) for th in table.select("thead th")]
         if not headers:
             continue
-        header_set = set(h.lower() for h in headers)
-        if "gardiens" in header_set:
+        hs = set(h.lower() for h in headers)
+        if "gardiens" in hs:
             for tr in table.select("tbody tr"):
                 tds = [td.get_text(strip=True) for td in tr.find_all("td")]
                 if len(tds) < 2:
@@ -317,7 +333,7 @@ def parse_roster_structured(html: str):
                 nom, num = split_name_and_number(tds[0])
                 if nom:
                     gardiens.append({"nom": nom, "numero": num, "stats": dict(zip(headers, tds))})
-        elif "joueurs" in header_set:
+        elif "joueurs" in hs:
             for tr in table.select("tbody tr"):
                 tds = [td.get_text(strip=True) for td in tr.find_all("td")]
                 if len(tds) < 2:
@@ -363,22 +379,18 @@ def parse_table_generic(html: str, debug_name: str = "generic"):
 
 async def scrape_and_publish():
     print(f"\n{'='*50}")
-    print(f"[START] RseqHockey v5.0.0 (API) - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v2.7.0 (Playwright schedule) - {MY_TEAM_NAME}")
     print(f"{'='*50}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
     team_url = f"https://scolaire.rseqhockey.com/fr/teams/{TEAM_ID}"
 
+    # --- 1. Horaire : Playwright avec clics ---
+    schedule_html = await fetch_schedule_with_clicks(team_url)
+
+    # --- 2. Roster + Stats : FlareSolverr ---
     timeout = aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT + 30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-
-        print("\n[ÉTAPE 1] API /sp/games")
-        games_data = await api_get_games(session)
-
-        print("\n[ÉTAPE 2] API /sp/standings")
-        standings_data = await api_get_standings(session)
-
-        print("\n[ÉTAPE 3] FlareSolverr pour roster + stats")
         roster_html = await fetch_with_flaresolverr(session, f"{team_url}?tab=roster", "roster")
         stats_html = await fetch_with_flaresolverr(
             session,
@@ -388,32 +400,26 @@ async def scrape_and_publish():
 
     # --- PARSING ---
     print("\n[PARSING]...")
-    matchs = parse_games(games_data) if games_data else []
-
+    matchs = parse_schedule_cards(schedule_html) if schedule_html else []
     roster_data = parse_roster_structured(roster_html) if roster_html else {"gardiens": [], "joueurs": [], "personnel": []}
     player_stats_sr = parse_table_generic(stats_html, "stats_saison_reguliere") if stats_html else []
 
-    # Séparer joués / à venir
     joues = [m for m in matchs if m["joue"]]
     a_venir = [m for m in matchs if not m["joue"]]
+
+    # Trier par date ISO
+    joues.sort(key=lambda m: m.get("iso", ""))
+    a_venir.sort(key=lambda m: m.get("iso", ""))
 
     last_match = joues[-1] if joues else None
     next_match = a_venir[0] if a_venir else None
 
     print(f"[STATS] {len(joues)} joué(s), {len(a_venir)} à venir.")
     if last_match:
-        print(f"   Dernier: {last_match['date']} {last_match['equipe_visiteur']} {last_match['score']} {last_match['equipe_domicile']}")
+        print(f"   Dernier: {last_match['date']} {last_match['equipes']} {last_match['score']}")
     if next_match:
         print(f"   Prochain: {next_match['date']} {next_match['heure']} @ {next_match['arene']}")
 
-    # Classement : chercher notre équipe
-    standings_list = []
-    if standings_data:
-        raw_std = standings_data.get("data") if isinstance(standings_data, dict) else standings_data
-        if isinstance(raw_std, list):
-            standings_list = raw_std
-
-    # Player suivi
     player_info_sr = next(
         (p for p in player_stats_sr if TRACKED_PLAYER in p.get("Nom", "").lower()),
         None
@@ -431,7 +437,7 @@ async def scrape_and_publish():
         print(f"\n[MQTT DISCOVERY] {topic}")
         publish_to_mqtt(topic, cfg)
 
-    # --- ROSTER ---
+    # Roster
     total_joueurs = len(roster_data["joueurs"]) + len(roster_data["gardiens"])
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_roster/config",
@@ -442,12 +448,11 @@ async def scrape_and_publish():
                     f"{total_joueurs} joueurs | {len(roster_data['personnel'])} instructeurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/roster/attributes", roster_data)
 
-    # --- PROCHAIN MATCH ---
+    # Prochain match
     if next_match:
         state = f"{next_match['date']} {next_match['heure']} - {next_match['arene']}"
     else:
         state = "Aucun match prévu"
-
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_schedule/config",
         build_config(f"RSEQ Prochain match", f"rseqhockey_{TEAM_ID}_schedule",
@@ -457,25 +462,17 @@ async def scrape_and_publish():
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/schedule/attributes", {
         "prochain_match": next_match,
         "matchs_a_venir": a_venir,
-        "nb_matchs_a_venir": len(a_venir),
+        "nb_total": len(matchs),
     })
 
-    # --- DERNIER MATCH (avec score et résultat) ---
+    # Dernier match
     if last_match:
-        # Format : "VEN. 02 OCT. : MON ECOLE 1-0 ÉCOLE SEC. POINTE-LÉVY (V)"
-        if last_match.get("equipe_visiteur") and last_match.get("equipe_domicile"):
-            last_state = (
-                f"{last_match['date']} : "
-                f"{last_match['equipe_visiteur']} {last_match['score']} "
-                f"{last_match['equipe_domicile']}"
-            )
-            if last_match.get("resultat"):
-                last_state += f" ({last_match['resultat']})"
+        if len(last_match["equipes"]) >= 2:
+            last_state = f"{last_match['date']} : {' '.join(last_match['equipes'])} {last_match['score']}"
         else:
             last_state = f"{last_match['date']} | {last_match['score']}"
     else:
         last_state = "Aucun match joué"
-
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_last_match/config",
         build_config(f"RSEQ Dernier match", f"rseqhockey_{TEAM_ID}_last_match",
@@ -487,18 +484,7 @@ async def scrape_and_publish():
         "tous_les_matchs_joues": joues,
     })
 
-    # --- CLASSEMENT ---
-    publish_config(
-        f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config",
-        build_config(f"RSEQ Classement", f"rseqhockey_{TEAM_ID}_standings",
-                     f"rseqhockey/{TEAM_ID}/standings/state",
-                     f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy"))
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state",
-                    f"{len(standings_list)} équipes" if standings_list else "Saison en cours")
-    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes",
-                    {"classement": standings_list})
-
-    # --- JOUEUR SUIVI ---
+    # Joueur suivi
     if TRACKED_PLAYER:
         ps = re.sub(r'[^a-zA-Z0-9]', '_', TRACKED_PLAYER)
         pts = player_info_sr.get("PTS", "0") if player_info_sr else "0"
@@ -510,7 +496,7 @@ async def scrape_and_publish():
         publish_to_mqtt(f"rseqhockey/player/{ps}/state", f"SR: {pts} pts")
         publish_to_mqtt(f"rseqhockey/player/{ps}/attributes", {"stats_saison_reguliere": player_info_sr})
 
-    # --- STATS SAISON ---
+    # Stats saison
     publish_config(
         f"homeassistant/sensor/rseqhockey_{TEAM_ID}_stats_saison_reguliere/config",
         build_config(f"RSEQ Stats Saison", f"rseqhockey_{TEAM_ID}_stats_saison_reguliere",
