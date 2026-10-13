@@ -717,4 +717,13 @@ async def scrape_and_publish():
                      f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state",
                      f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"{len(player_stats_sr)} joueurs")
-   
+    publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", {"joueurs": player_stats_sr})
+
+    print("\n[FIN] Cycle terminé.")
+
+
+if __name__ == "__main__":
+    while True:
+        asyncio.run(scrape_and_publish())
+        print(f"\n[ATTENTE] {INTERVAL / 3600}h...")
+        time.sleep(INTERVAL)
