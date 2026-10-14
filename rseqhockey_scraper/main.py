@@ -668,12 +668,15 @@ def parse_standings(html: str):
             tables.append(rows)
     if not tables:
         print("[PARSING STANDINGS] Équipe introuvable dans le classement.")
-        return [], None, None
+        return [], None, None, []
     tables.sort(key=len)
     division, ligue = tables[0], tables[-1]
     rang_ligue = next((r.get("#") for r in ligue if MY_TEAM_NAME in r.get("Équipe", "").upper()), None)
     print(f"[PARSING STANDINGS] Division: {len(division)} équipes, ligue: {len(ligue)} équipes.")
-    return division, rang_ligue, len(ligue)
+    # Version allégée de la ligue complète (sans logo distant) pour limiter la taille de l'attribut.
+    # Lighter copy of the whole league (no remote logo) to keep the attribute small.
+    ligue_courte = [{k: r.get(k) for k in ("#", "Équipe", "MJ", "V", "D", "N", "PTS", "logo_local")} for r in ligue]
+    return division, rang_ligue, len(ligue), ligue_courte
 
 
 # ============================================================
@@ -716,7 +719,7 @@ async def scrape_and_publish():
     matchs = parse_schedule_cards(schedule_html) if schedule_html else []
     roster_data = parse_roster_structured(roster_html) if roster_html else {"gardiens": [], "joueurs": [], "personnel": []}
     player_stats_sr = parse_table_generic(stats_html, "stats_saison_reguliere") if stats_html else []
-    division, rang_ligue, nb_ligue = parse_standings(standings_html) if standings_html else ([], None, None)
+    division, rang_ligue, nb_ligue, ligue = parse_standings(standings_html) if standings_html else ([], None, None, [])
     mon_equipe = next((r for r in division if MY_TEAM_NAME in r.get("Équipe", "").upper()), None)
 
     joues = [m for m in matchs if m["joue"]]
@@ -825,6 +828,7 @@ async def scrape_and_publish():
             "classement_complet": division,
             "rang_ligue": rang_ligue,
             "nb_equipes_ligue": nb_ligue,
+            "classement_ligue": ligue,
         })
 
     print("\n[FIN] Cycle terminé.")
