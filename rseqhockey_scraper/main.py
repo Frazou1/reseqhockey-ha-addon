@@ -32,15 +32,13 @@ LEAGUE_UUID = "ae5bed83-a302-4ac5-927b-639d2c20a3c9"
 SCHEDULE_SAISON_REGULIERE = "198862"
 BASE_WEB = "https://scolaire.rseqhockey.com/fr"
 
-LOGOS_DIR = "/share/rseqhockey_logos"
+# Logos écrits directement dans /config/www : HA ne sert pas /local à travers un lien symbolique vers /share.
+# Logos written straight into /config/www: HA won't serve /local through a symlink to /share.
 WWW_LOGOS_DIR = "/config/www/rseqhockey_logos"
+if os.path.islink(WWW_LOGOS_DIR):
+    os.unlink(WWW_LOGOS_DIR)
+LOGOS_DIR = WWW_LOGOS_DIR if os.path.isdir("/config") else "/share/rseqhockey_logos"
 os.makedirs(LOGOS_DIR, exist_ok=True)
-
-if os.path.exists("/config/www") and not os.path.exists(WWW_LOGOS_DIR):
-    try:
-        os.symlink(LOGOS_DIR, WWW_LOGOS_DIR)
-    except Exception as e:
-        print(f"[LOGOS Note] {e}")
 
 DEVICE_INFO = {
     "identifiers": [f"rseqhockey_team_{TEAM_ID}"],
@@ -646,6 +644,38 @@ def parse_table_generic(html: str, debug_name: str = "generic"):
     return rows
 
 
+def parse_standings(html: str):
+    """Classement de la division de l'équipe + rang dans la ligue.
+    Team's division standings + rank in the whole league."""
+    soup = BeautifulSoup(html, "html.parser")
+    tables = []
+    for table in soup.find_all("table"):
+        headers = [th.get_text(strip=True) for th in table.select("thead th")]
+        if "Équipe" not in headers:
+            continue
+        rows = []
+        for tr in table.select("tbody tr"):
+            tds = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if len(tds) < len(headers):
+                continue
+            row = dict(zip(headers, tds))
+            img = tr.find("img")
+            remote = img.get("src", "") if img else ""
+            row["logo_remote"] = remote
+            row["logo_local"] = download_logo(remote, row.get("Équipe", "")) if remote else ""
+            rows.append(row)
+        if any(MY_TEAM_NAME in r.get("Équipe", "").upper() for r in rows):
+            tables.append(rows)
+    if not tables:
+        print("[PARSING STANDINGS] Équipe introuvable dans le classement.")
+        return [], None, None
+    tables.sort(key=len)
+    division, ligue = tables[0], tables[-1]
+    rang_ligue = next((r.get("#") for r in ligue if MY_TEAM_NAME in r.get("Équipe", "").upper()), None)
+    print(f"[PARSING STANDINGS] Division: {len(division)} équipes, ligue: {len(ligue)} équipes.")
+    return division, rang_ligue, len(ligue)
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -671,6 +701,11 @@ async def scrape_and_publish():
         )
 
         roster_html = await fetch_with_flaresolverr(session, f"{team_url}?tab=roster", "roster")
+        standings_html = await fetch_with_flaresolverr(
+            session,
+            f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=standings",
+            "standings"
+        )
         stats_html = await fetch_with_flaresolverr(
             session,
             f"{base_url}?categoryId={LEAGUE_UUID}&scheduleId={SCHEDULE_SAISON_REGULIERE}&tab=playerstats",
@@ -681,6 +716,8 @@ async def scrape_and_publish():
     matchs = parse_schedule_cards(schedule_html) if schedule_html else []
     roster_data = parse_roster_structured(roster_html) if roster_html else {"gardiens": [], "joueurs": [], "personnel": []}
     player_stats_sr = parse_table_generic(stats_html, "stats_saison_reguliere") if stats_html else []
+    division, rang_ligue, nb_ligue = parse_standings(standings_html) if standings_html else ([], None, None)
+    mon_equipe = next((r for r in division if MY_TEAM_NAME in r.get("Équipe", "").upper()), None)
 
     joues = [m for m in matchs if m["joue"]]
     a_venir = [m for m in matchs if not m["joue"]]
@@ -774,6 +811,21 @@ async def scrape_and_publish():
                      f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", "mdi:hockey-sticks"))
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/state", f"{len(player_stats_sr)} joueurs")
     publish_to_mqtt(f"rseqhockey/{TEAM_ID}/stats_saison_reguliere/attributes", {"joueurs": player_stats_sr})
+
+    if division:
+        publish_config(
+            f"homeassistant/sensor/rseqhockey_{TEAM_ID}_standings/config",
+            build_config(f"RSEQ Classement", f"rseqhockey_{TEAM_ID}_standings",
+                         f"rseqhockey/{TEAM_ID}/standings/state",
+                         f"rseqhockey/{TEAM_ID}/standings/attributes", "mdi:trophy"))
+        publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/state",
+                        f"{mon_equipe.get('#', '?')}e / {len(division)}" if mon_equipe else "Hors classement")
+        publish_to_mqtt(f"rseqhockey/{TEAM_ID}/standings/attributes", {
+            "mon_equipe": mon_equipe,
+            "classement_complet": division,
+            "rang_ligue": rang_ligue,
+            "nb_equipes_ligue": nb_ligue,
+        })
 
     print("\n[FIN] Cycle terminé.")
 
