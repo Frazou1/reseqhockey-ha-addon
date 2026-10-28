@@ -11,6 +11,10 @@ import aiohttp
 from bs4 import BeautifulSoup
 import paho.mqtt.client as mqtt
 from playwright.async_api import async_playwright
+import rythme
+
+# Matchs du dernier cycle, pour le rythme adaptatif / last cycle's games, for the adaptive rhythm
+DERNIERS_MATCHS = []
 
 with open("/data/options.json", "r") as f:
     config = json.load(f)
@@ -723,7 +727,7 @@ def parse_standings(html: str):
 
 async def scrape_and_publish():
     print(f"\n{'='*60}")
-    print(f"[START] RseqHockey v3.3.2 - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v3.4.0 - {MY_TEAM_NAME}")
     print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -755,6 +759,7 @@ async def scrape_and_publish():
 
     print("\n[PARSING]...")
     matchs = merge_schedule(schedule_html) if schedule_html else []
+    DERNIERS_MATCHS[:] = matchs
     roster_data = parse_roster_structured(roster_html) if roster_html else {"gardiens": [], "joueurs": [], "personnel": []}
     player_stats_sr = parse_table_generic(stats_html, "stats_saison_reguliere") if stats_html else []
     division, rang_ligue, nb_ligue, ligue = parse_standings(standings_html) if standings_html else ([], None, None, [])
@@ -875,5 +880,9 @@ async def scrape_and_publish():
 if __name__ == "__main__":
     while True:
         asyncio.run(scrape_and_publish())
-        print(f"\n[ATTENTE] {INTERVAL / 3600}h...")
-        time.sleep(INTERVAL)
+        # Rythme adaptatif les jours de match (rythme.py) / adaptive rhythm on game days
+        attente, raison = rythme.delai(
+            [(f"{m.get('iso')}|{'/'.join(m.get('equipes', []))}", rythme.lire_iso(m.get("iso")), bool(m.get("joue")))
+             for m in DERNIERS_MATCHS], INTERVAL)
+        print(f"\n[ATTENTE] {attente / 60:.0f} min ({raison})...")
+        time.sleep(attente)
