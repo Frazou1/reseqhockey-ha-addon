@@ -19,8 +19,8 @@ DERNIERS_MATCHS = []
 with open("/data/options.json", "r") as f:
     config = json.load(f)
 
-TEAM_ID = config.get("team_id", "000001")
-MY_TEAM_NAME = config.get("team_name", "MON ECOLE").upper()
+TEAM_ID = config.get("team_id", "")
+MY_TEAM_NAME = config.get("team_name", "").upper()
 TRACKED_PLAYER = config.get("tracked_player", "").strip().lower()
 
 MQTT_HOST = config.get("mqtt_host", "core-mosquitto")
@@ -29,7 +29,7 @@ MQTT_USER = config.get("mqtt_user", "")
 MQTT_PASS = config.get("mqtt_password", "")
 INTERVAL = config.get("update_interval_hours", 6) * 3600
 
-FLARESOLVERR_URL = config.get("flaresolverr_url", "http://192.168.1.65:8191/v1")
+FLARESOLVERR_URL = config.get("flaresolverr_url", "http://localhost:8191/v1")
 FLARESOLVERR_TIMEOUT = config.get("flaresolverr_timeout", 90)
 
 LEAGUE_UUID = "ae5bed83-a302-4ac5-927b-639d2c20a3c9"

@@ -10,9 +10,9 @@ map:
   - share:rw
   - config:rw
 options:
-  team_id: "000001"
-  team_name: "MON ECOLE"
-  tracked_player: "Joueur"
+  team_id: ""
+  team_name: ""
+  tracked_player: ""
   season_start: "2026-09-19"
   season_end: "2027-04-01"
   timezone: "America/Toronto"
@@ -21,7 +21,7 @@ options:
   mqtt_port: 1883
   mqtt_user: ""
   mqtt_password: ""
-  flaresolverr_url: "http://192.168.1.65:8191/v1"
+  flaresolverr_url: "http://<ip-flaresolverr>:8191/v1"
   flaresolverr_timeout: 90
 schema:
   team_id: str
