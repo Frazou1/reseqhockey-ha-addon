@@ -222,8 +222,23 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
             await page.wait_for_timeout(1000)
 
         await page.wait_for_timeout(2000)
-        html = await page.content()
-        print(f"\n[PLAYWRIGHT OK] HTML final: {len(html)} octets")
+        # La vue « Saison » n'affiche les cartes de match que lorsqu'elles sont a l'ecran : on defile par
+        # etapes et on capture la page a chaque etape (les cartes sont fusionnees au parsing).
+        # The Season view only renders game cards while on screen: scroll step by step, snapshot each step.
+        captures = [await page.content()]
+        hauteur_prec, immobile = 0, 0
+        for _ in range(40):
+            await page.evaluate("window.scrollBy(0, 500)")
+            await page.wait_for_timeout(1500)
+            captures.append(await page.content())
+            pos = await page.evaluate("[window.scrollY + window.innerHeight, document.body.scrollHeight]")
+            if pos[0] >= pos[1] - 5:
+                immobile = immobile + 1 if pos[1] == hauteur_prec else 0
+                if immobile >= 2:
+                    break
+            hauteur_prec = pos[1]
+        html = captures[-1]
+        print(f"\n[PLAYWRIGHT OK] {len(captures)} capture(s) de la vue « Saison », dernière: {len(html)} octets")
 
         try:
             with open("/share/schedule_debug.html", "w", encoding="utf-8") as f:
@@ -235,7 +250,30 @@ async def fetch_schedule_with_playwright(team_url, cookies, user_agent):
         print(f"[PLAYWRIGHT] {count} section(s) data-date-section détectée(s).")
 
         await browser.close()
-        return html
+        return captures
+
+
+# Historique des matchs joues, conserve d'un cycle a l'autre : une page incomplete ne fait plus
+# disparaitre un match. / Played-games history kept across cycles.
+HISTO = "/data/matchs_joues.json"
+
+
+def merge_schedule(captures):
+    """Fusionne les matchs de toutes les captures + l'historique, sans doublons (date, equipes).
+    Merges games from all snapshots + history, deduplicated on (date, teams)."""
+    try:
+        matchs = [m for m in json.load(open(HISTO, encoding="utf-8")) if m.get("joue")]
+    except Exception:
+        matchs = []
+    for cap in captures or []:
+        for m in parse_schedule_cards(cap):
+            cle = (m.get("date_iso"), tuple(m.get("equipes", [])))
+            matchs = [x for x in matchs if (x.get("date_iso"), tuple(x.get("equipes", []))) != cle] + [m]
+    try:
+        json.dump([m for m in matchs if m.get("joue")], open(HISTO, "w", encoding="utf-8"), ensure_ascii=False)
+    except Exception as e:
+        print(f"[HISTO] Écriture impossible: {e}")
+    return matchs
 
 
 # ============================================================
@@ -685,7 +723,7 @@ def parse_standings(html: str):
 
 async def scrape_and_publish():
     print(f"\n{'='*60}")
-    print(f"[START] RseqHockey v3.3.0 - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v3.3.2 - {MY_TEAM_NAME}")
     print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -716,7 +754,7 @@ async def scrape_and_publish():
         )
 
     print("\n[PARSING]...")
-    matchs = parse_schedule_cards(schedule_html) if schedule_html else []
+    matchs = merge_schedule(schedule_html) if schedule_html else []
     roster_data = parse_roster_structured(roster_html) if roster_html else {"gardiens": [], "joueurs": [], "personnel": []}
     player_stats_sr = parse_table_generic(stats_html, "stats_saison_reguliere") if stats_html else []
     division, rang_ligue, nb_ligue, ligue = parse_standings(standings_html) if standings_html else ([], None, None, [])
