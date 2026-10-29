@@ -266,7 +266,7 @@ def merge_schedule(captures):
     """Fusionne les matchs de toutes les captures + l'historique, sans doublons (date, equipes).
     Merges games from all snapshots + history, deduplicated on (date, teams)."""
     try:
-        matchs = [m for m in json.load(open(HISTO, encoding="utf-8")) if m.get("joue")]
+        matchs = [m for m in json.load(open(HISTO, encoding="utf-8")) if rythme.histo_valide(m)]
     except Exception:
         matchs = []
     for cap in captures or []:
@@ -274,7 +274,7 @@ def merge_schedule(captures):
             cle = (m.get("date_iso"), tuple(m.get("equipes", [])))
             matchs = [x for x in matchs if (x.get("date_iso"), tuple(x.get("equipes", []))) != cle] + [m]
     try:
-        json.dump([m for m in matchs if m.get("joue")], open(HISTO, "w", encoding="utf-8"), ensure_ascii=False)
+        json.dump([m for m in matchs if rythme.histo_valide(m)], open(HISTO, "w", encoding="utf-8"), ensure_ascii=False)
     except Exception as e:
         print(f"[HISTO] Écriture impossible: {e}")
     return rythme.garder_debuts(matchs)
@@ -731,7 +731,7 @@ def parse_standings(html: str):
 
 async def scrape_and_publish():
     print(f"\n{'='*60}")
-    print(f"[START] RseqHockey v3.4.1 - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v3.4.2 - {MY_TEAM_NAME}")
     print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"

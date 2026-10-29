@@ -37,6 +37,12 @@ def cle_match(m):
     return f"{m.get('date_iso')}|{'/'.join(m.get('equipes', []))}"
 
 
+def histo_valide(m):
+    """Match a garder dans l'historique : joue, FINAL et date connue (purge les anciennes entrees
+    « Aujourd'hui … EN COURS 0-0 »). / History entry: played, FINAL and dated."""
+    return bool(m.get("joue")) and bool(m.get("date_iso")) and str(m.get("statut", "FINAL")).upper() == "FINAL"
+
+
 def garder_debuts(matchs, fichier=DEBUTS):
     """La page retire l'heure du match une fois commence : on remet celle vue avant.
     The page drops the start time once the game starts: restore the one seen earlier."""
@@ -68,7 +74,7 @@ def entree(m, maintenant=None):
     """(cle, debut, joue) pour delai() ; un match en cours sans heure connue compte comme commence.
     Entry for delai(); a live game with no known start time counts as started now."""
     debut = lire_iso(m.get("iso"))
-    if debut is None and str(m.get("statut", "")).upper() in EN_JEU:
+    if debut is None and not m.get("joue") and str(m.get("statut", "")).upper() in EN_JEU:
         debut = maintenant or datetime.now(timezone.utc)
     return cle_match(m), debut, bool(m.get("joue"))
 
