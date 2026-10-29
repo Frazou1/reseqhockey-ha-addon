@@ -277,7 +277,7 @@ def merge_schedule(captures):
         json.dump([m for m in matchs if m.get("joue")], open(HISTO, "w", encoding="utf-8"), ensure_ascii=False)
     except Exception as e:
         print(f"[HISTO] Écriture impossible: {e}")
-    return matchs
+    return rythme.garder_debuts(matchs)
 
 
 # ============================================================
@@ -404,7 +404,10 @@ _MOIS_ABBR = {
 
 
 def _parse_date_header(h4_text: str):
-    m = re.match(r'(\w+)\s+(\d{1,2})\s+(\w+)\s+(\d{4})', h4_text.strip(), re.I)
+    # « Aujourd'hui, jeudi 29 octobre 2026 » : le jour de semaine peut etre precede d'un mot
+    # "Today, Thursday ...": the weekday may follow a prefix
+    m = re.search(r'(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)\s+(\d{1,2})\s+(\w+)\s+(\d{4})',
+                  h4_text.strip(), re.I)
     if not m:
         return h4_text, ""
     jour, num, mois, annee = m.group(1).lower(), int(m.group(2)), m.group(3).lower(), int(m.group(4))
@@ -518,7 +521,8 @@ def parse_schedule_cards(html: str):
                         "logo_local": logo_local,
                     })
 
-            joue = bool(score)
+            # Joue seulement une fois FINAL (un match EN COURS affiche deja 0-0) / played only once FINAL
+            joue = bool(score) and status == "FINAL"
             match = {
                 "numero": num_match,
                 "date": date_fr,
@@ -727,7 +731,7 @@ def parse_standings(html: str):
 
 async def scrape_and_publish():
     print(f"\n{'='*60}")
-    print(f"[START] RseqHockey v3.4.0 - {MY_TEAM_NAME}")
+    print(f"[START] RseqHockey v3.4.1 - {MY_TEAM_NAME}")
     print(f"{'='*60}")
 
     base_url = f"https://scolaire.rseqhockey.com/fr/schedule-stats-standings/{LEAGUE_UUID}"
@@ -881,8 +885,6 @@ if __name__ == "__main__":
     while True:
         asyncio.run(scrape_and_publish())
         # Rythme adaptatif les jours de match (rythme.py) / adaptive rhythm on game days
-        attente, raison = rythme.delai(
-            [(f"{m.get('iso')}|{'/'.join(m.get('equipes', []))}", rythme.lire_iso(m.get("iso")), bool(m.get("joue")))
-             for m in DERNIERS_MATCHS], INTERVAL)
+        attente, raison = rythme.delai([rythme.entree(m) for m in DERNIERS_MATCHS], INTERVAL)
         print(f"\n[ATTENTE] {attente / 60:.0f} min ({raison})...")
         time.sleep(attente)

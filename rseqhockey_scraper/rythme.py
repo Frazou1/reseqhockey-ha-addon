@@ -10,6 +10,8 @@ import json
 from datetime import datetime, timedelta, timezone
 
 ETAT = "/data/rythme_fins.json"      # heure de fin detectee par match / detected end time per game
+DEBUTS = "/data/debuts_matchs.json"  # heure de debut vue avant le match / start time seen before the game
+EN_JEU = ("EN COURS", "PROLONGATION", "FUSILLADE")
 EN_MATCH = timedelta(minutes=10)
 APRES = timedelta(hours=1)
 APRES_DUREE = timedelta(hours=3)
@@ -28,6 +30,47 @@ def lire_iso(txt, tz_locale=None):
     if d.tzinfo is None:
         d = d.replace(tzinfo=tz_locale or timezone.utc)
     return d
+
+
+def cle_match(m):
+    """Cle stable d'un match (date + equipes) / stable game key."""
+    return f"{m.get('date_iso')}|{'/'.join(m.get('equipes', []))}"
+
+
+def garder_debuts(matchs, fichier=DEBUTS):
+    """La page retire l'heure du match une fois commence : on remet celle vue avant.
+    The page drops the start time once the game starts: restore the one seen earlier."""
+    try:
+        with open(fichier, encoding="utf-8") as f:
+            debuts = json.load(f)
+    except Exception:
+        debuts = {}
+    for m in matchs:
+        cle = cle_match(m)
+        if not m.get("date_iso"):
+            continue
+        if m.get("iso"):
+            debuts[cle] = [m["iso"], m.get("heure", "")]
+        elif cle in debuts:
+            m["iso"] = debuts[cle][0]
+            m["heure"] = m.get("heure") or debuts[cle][1]
+    limite = (datetime.now(timezone.utc) - timedelta(days=30)).date().isoformat()
+    debuts = {k: v for k, v in debuts.items() if k[:10] >= limite}
+    try:
+        with open(fichier, "w", encoding="utf-8") as f:
+            json.dump(debuts, f)
+    except Exception:
+        pass
+    return matchs
+
+
+def entree(m, maintenant=None):
+    """(cle, debut, joue) pour delai() ; un match en cours sans heure connue compte comme commence.
+    Entry for delai(); a live game with no known start time counts as started now."""
+    debut = lire_iso(m.get("iso"))
+    if debut is None and str(m.get("statut", "")).upper() in EN_JEU:
+        debut = maintenant or datetime.now(timezone.utc)
+    return cle_match(m), debut, bool(m.get("joue"))
 
 
 def delai(matchs, normal_s, maintenant=None, etat=ETAT):
